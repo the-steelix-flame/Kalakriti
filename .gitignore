@@ -1,0 +1,37 @@
+# ── dependencies ───────────────────────────────────────────────────────────
+node_modules/
+.venv/
+__pycache__/
+*.pyc
+
+# ── secrets: never commit these ────────────────────────────────────────────
+.env
+.env.local
+.env.*.local
+*.pem
+jwt_secret.txt
+passport_key.pem
+
+# ── generated native project (recreate with `npx expo prebuild`) ───────────
+app/android/
+app/ios/
+
+# ── build output ───────────────────────────────────────────────────────────
+.expo/
+dist/
+web-build/
+*.apk
+*.aab
+build/
+.gradle/
+
+# ── runtime data ───────────────────────────────────────────────────────────
+backend/*.db
+backend/media/
+*.log
+
+# ── editor / OS ────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

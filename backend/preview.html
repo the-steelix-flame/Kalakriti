@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Kalakriti — mobile preview</title>
+<style>
+  :root { color-scheme: light; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 14px; padding: 18px;
+    background: #17120E;
+    font: 14px/1.45 -apple-system, "Segoe UI", system-ui, sans-serif;
+    color: #E8DFD3;
+  }
+  header { text-align: center; }
+  h1 { margin: 0; font-size: 17px; letter-spacing: .2px; }
+  h1 span { color: #E0894F; }
+  p  { margin: 4px 0 0; font-size: 12px; color: #9C8E80; }
+  .phone {
+    position: relative; width: 390px; height: 844px; max-height: calc(100vh - 130px);
+    background: #000; border-radius: 44px; padding: 11px;
+    box-shadow: 0 0 0 2px #3A322B, 0 26px 60px rgba(0,0,0,.6);
+    flex-shrink: 0;
+  }
+  .notch {
+    position: absolute; top: 11px; left: 50%; transform: translateX(-50%);
+    width: 126px; height: 26px; background: #000; border-radius: 0 0 16px 16px; z-index: 3;
+  }
+  iframe {
+    width: 100%; height: 100%; border: 0; border-radius: 34px; background: #FFFDF8;
+    display: block;
+  }
+  .bar { display: flex; gap: 8px; align-items: center; font-size: 12px; }
+  .dot { width: 8px; height: 8px; border-radius: 99px; background: #C25; }
+  .dot.ok { background: #3FBF87; }
+  a { color: #E0894F; }
+  code { color: #C9BCAE; }
+</style>
+</head>
+<body>
+  <header>
+    <h1>शिल्प<span>Ichiba</span></h1>
+    <p>Craft, and the market it could never reach.</p>
+  </header>
+
+  <div class="phone">
+    <div class="notch"></div>
+    <iframe id="app" src="http://localhost:8081"
+            allow="camera; microphone; clipboard-write"></iframe>
+  </div>
+
+  <div class="bar">
+    <span class="dot" id="d1"></span><span id="s1">API…</span>
+    <span style="opacity:.4">·</span>
+    <span class="dot" id="d2"></span><span id="s2">Metro…</span>
+  </div>
+
+<script>
+  // Mic and camera need a secure context; localhost counts as one, so the
+  // browser will prompt normally inside the frame.
+  async function ping(url, dot, label, name) {
+    try {
+      const r = await fetch(url, { mode: 'cors' });
+      const j = await r.json().catch(() => ({}));
+      dot.classList.add('ok');
+      label.textContent = name + (j.llm ? ' · ' + j.llm : ' ok');
+    } catch {
+      label.textContent = name + ' down';
+    }
+  }
+  ping('http://localhost:8000/health', d1, s1, 'API');
+  // Metro has no JSON health route; a successful frame load is the signal.
+  document.getElementById('app').addEventListener('load', () => {
+    d2.classList.add('ok'); s2.textContent = 'Metro ok';
+  });
+  setTimeout(() => { if (!d2.classList.contains('ok')) s2.textContent = 'Metro starting…'; }, 4000);
+</script>
+</body>
+</html>

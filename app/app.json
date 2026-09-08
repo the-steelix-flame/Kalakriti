@@ -1,0 +1,53 @@
+{
+  "expo": {
+    "name": "Kalakriti",
+    "slug": "kalakriti",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "light",
+    "newArchEnabled": true,
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "in.kalakriti.app"
+    },
+    "android": {
+      "package": "in.kalakriti.app",
+      "adaptiveIcon": {
+        "backgroundColor": "#B4531F",
+        "foregroundImage": "./assets/android-icon-foreground.png",
+        "backgroundImage": "./assets/android-icon-background.png",
+        "monochromeImage": "./assets/android-icon-monochrome.png"
+      },
+      "predictiveBackGestureEnabled": false,
+      "permissions": [
+        "android.permission.CAMERA",
+        "android.permission.RECORD_AUDIO",
+        "android.permission.ACCESS_FINE_LOCATION"
+      ]
+    },
+    "web": {
+      "favicon": "./assets/favicon.png"
+    },
+    "plugins": [
+      "expo-audio",
+      "expo-sqlite",
+      "expo-localization",
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Kalakriti needs the camera to photograph your products.",
+          "microphonePermission": "Kalakriti needs the microphone so you can describe products by voice."
+        }
+      ],
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "Kalakriti needs your photos to build product listings."
+        }
+      ],
+      "expo-font",
+      "./plugins/withLocalNetworkAccess"
+    ]
+  }
+}

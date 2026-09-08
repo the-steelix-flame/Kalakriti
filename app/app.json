@@ -47,7 +47,8 @@
         }
       ],
       "expo-font",
-      "./plugins/withLocalNetworkAccess"
+      "./plugins/withLocalNetworkAccess",
+      "expo-secure-store"
     ]
   }
 }

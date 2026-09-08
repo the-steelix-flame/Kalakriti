@@ -1,77 +1,86 @@
+/**
+ * My Products: the product management centre.
+ *
+ * Each row now carries the whole lifecycle rather than a status word: where it is
+ * listed, how many people looked, how many sold, what came in, when it last changed.
+ * Those come from `listing_card` on the backend, which counts real rows - orders that
+ * were actually paid, views that were actually served.
+ *
+ * Two states here do not exist as database columns and are derived, because the column
+ * would mislead:
+ *
+ *   partial  - live on some marketplaces, failed on others. Stored as "published",
+ *              which hides the half that needs fixing.
+ *   failed   - submitted, and every channel rejected it. Also stored as "published"
+ *              in the naive reading; it is the opposite of published.
+ *
+ * Tapping a product opens its detail page. It used to open the editor, which meant
+ * there was no way to look at a product without being invited to change it.
+ */
 import React, { useMemo, useState } from 'react';
-import { View, Text, Image, Pressable, Linking } from 'react-native';
+import { View, Text, Image, Pressable, RefreshControl } from 'react-native';
 import { Card, Pill, StatusChip, Skeleton, money } from '../ui';
+import { FilterBar, applyList, byDate, byNum, FilterDef, SortDef } from '../ui/Filters';
 import { C, S, T, R } from '../theme';
-import { Camera, Globe, Check } from '../icons';
+import { Camera, Globe, Warning, Trend } from '../icons';
 import { TabScreen } from '../nav/Shell';
 import { useI18n } from '../i18n';
+import { ago } from '../lib/ago';
 import * as api from '../lib/api';
 
-/**
- * My Products: everything the artisan has made, grouped by where it is in its life.
- *
- * The filters mirror the real listing lifecycle stored in the database
- * (draft -> processing -> submitted -> published -> active -> sold), rather than
- * inventing categories, so a chip always corresponds to a state the backend can
- * actually be in.
- */
-const FILTERS = [
+const FILTERS: FilterDef<api.Card>[] = [
   { key: 'all', label: 'prod.all', match: () => true },
-  { key: 'draft', label: 'prod.draft', match: (s: string) => s === 'draft' || s === 'processing' },
-  { key: 'published', label: 'prod.published', match: (s: string) => s === 'submitted' || s === 'published' },
-  { key: 'active', label: 'prod.active', match: (s: string) => s === 'active' },
-  { key: 'sold', label: 'prod.sold', match: (s: string) => s === 'sold' },
+  { key: 'draft', label: 'prod.draft',
+    match: (c) => c.status === 'draft' || c.status === 'processing' },
+  { key: 'published', label: 'prod.published',
+    match: (c) => ['published', 'submitted', 'approved'].includes(c.status) },
+  { key: 'active', label: 'prod.active', match: (c) => c.status === 'active' },
+  { key: 'partial', label: 'prod.partial', match: (c) => c.status === 'partial' },
+  { key: 'failed', label: 'prod.failed', match: (c) => c.status === 'failed' },
+  { key: 'sold', label: 'prod.sold', match: (c) => c.status === 'sold' },
+];
+
+const SORTS: SortDef<api.Card>[] = [
+  { key: 'newest', label: 'sort.newest', cmp: byDate((c) => c.updatedAt, 1) },
+  { key: 'oldest', label: 'sort.oldest', cmp: byDate((c) => c.updatedAt, -1) },
+  { key: 'priceHigh', label: 'sort.priceHigh', cmp: byNum((c) => c.price, 1) },
+  { key: 'priceLow', label: 'sort.priceLow', cmp: byNum((c) => c.price, -1) },
+  { key: 'viewed', label: 'sort.mostViewed', cmp: byNum((c) => c.views, 1) },
+  { key: 'sold', label: 'sort.mostSold', cmp: byNum((c) => c.sold, 1) },
 ];
 
 export default function ProductsTab({
-  listings, loading, onOpen, onLanguage, onRefresh,
+  cards, loading, offline, lastSync, onOpen, onLanguage, onRefresh,
 }: {
-  listings: api.Listing[];
+  cards: api.Card[];
   loading: boolean;
+  offline: boolean;
+  lastSync: number | null;
   onOpen: (id: string) => void;
   onLanguage: () => void;
   onRefresh: () => void;
 }) {
   const { t } = useI18n();
   const [filter, setFilter] = useState('all');
+  const [sort, setSort] = useState('newest');
 
-  const shown = useMemo(() => {
-    const f = FILTERS.find((x) => x.key === filter) ?? FILTERS[0];
-    return listings.filter((l) => f.match(l.status));
-  }, [listings, filter]);
+  const shown = useMemo(
+    () => applyList(cards, FILTERS, filter, SORTS, sort),
+    [cards, filter, sort]);
 
   return (
-    <TabScreen title={t('prod.title')} onLanguage={onLanguage}
-               right={<Pressable onPress={onRefresh} hitSlop={10}
-                                 accessibilityLabel={t('create.refresh')}>
-                        <Pill text={t('create.refresh')} />
-                      </Pressable>}>
-      <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 6 }}>
-        {FILTERS.map((f) => {
-          const on = filter === f.key;
-          const n = listings.filter(f.match as any).length;
-          return (
-            <Pressable key={f.key} onPress={() => setFilter(f.key)}
-                       accessibilityLabel={t(f.label)}>
-              <View style={{
-                paddingHorizontal: 13, paddingVertical: 8, borderRadius: R.pill,
-                backgroundColor: on ? C.ink : C.bgAlt,
-              }}>
-                <Text style={{ fontFamily: 'Mukta_600SemiBold', fontSize: 13.5,
-                               color: on ? C.white : C.inkMid }}>
-                  {t(f.label)}{n ? ` · ${n}` : ''}
-                </Text>
-              </View>
-            </Pressable>
-          );
-        })}
-      </View>
+    <TabScreen
+      title={t('prod.title')}
+      subtitle={offline && lastSync ? t('sync.asOf', { ago: ago(t, lastSync) }) : undefined}
+      onLanguage={onLanguage}
+      refreshControl={<RefreshControl refreshing={loading} onRefresh={onRefresh}
+                                      tintColor={C.primary} />}
+    >
+      <FilterBar items={cards} filters={FILTERS} filter={filter} onFilter={setFilter}
+                 sorts={SORTS} sort={sort} onSort={setSort} />
 
-      {loading ? (
-        <>
-          <Card><Skeleton h={58} /></Card>
-          <Card><Skeleton h={58} /></Card>
-        </>
+      {loading && !cards.length ? (
+        <><Card><Skeleton h={72} /></Card><Card><Skeleton h={72} /></Card></>
       ) : shown.length === 0 ? (
         <Card style={{ alignItems: 'center', paddingVertical: S.xl, gap: S.sm }}>
           <View style={{ width: 54, height: 54, borderRadius: R.pill,
@@ -80,61 +89,74 @@ export default function ProductsTab({
             <Camera color={C.inkSoft} size={24} />
           </View>
           <Text style={T.body}>
-            {listings.length ? t('prod.emptyFiltered') : t('prod.empty')}
+            {cards.length ? t('prod.emptyFiltered') : t('prod.empty')}
           </Text>
-          {!listings.length ? (
+          {!cards.length ? (
             <Text style={[T.bodySoft, { textAlign: 'center' }]}>{t('prod.emptySub')}</Text>
           ) : null}
         </Card>
-      ) : shown.map((l) => {
-        const live = l.publications?.find((p) => p.status === 'published' && p.url);
-        return (
-          <Card key={l.id} onPress={() => onOpen(l.id)}>
-            <View style={{ flexDirection: 'row', gap: S.md }}>
-              {l.imageUrl ? (
-                <Image source={{ uri: l.imageUrl }}
-                       style={{ width: 72, height: 72, borderRadius: R.md,
-                                backgroundColor: C.bgAlt }} />
-              ) : (
-                <View style={{ width: 72, height: 72, borderRadius: R.md,
-                               backgroundColor: C.bgAlt, alignItems: 'center',
-                               justifyContent: 'center' }}>
-                  <Camera color={C.inkSoft} size={22} />
-                </View>
-              )}
-              <View style={{ flex: 1, gap: 4 }}>
-                <Text style={[T.body, { fontFamily: 'Mukta_700Bold' }]} numberOfLines={2}>
-                  {l.titleHi || l.titleEn || t('home.noDraftName')}
-                </Text>
-                <Text style={[T.body, { color: C.money, fontFamily: 'Mukta_700Bold' }]}>
-                  {l.price ? money(l.price) : t('home.priceMissing')}
-                </Text>
-                <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 5 }}>
-                  <StatusChip status={l.status} />
-                  {l.publications?.length ? (
-                    <Pill text={t('prod.channels', { n: l.publications.length })}
-                          tone="indigo" />
-                  ) : null}
-                </View>
+      ) : shown.map((c) => (
+        <Card key={c.id} onPress={() => onOpen(c.id)}>
+          <View style={{ flexDirection: 'row', gap: S.md }}>
+            {c.imageUrl ? (
+              <Image source={{ uri: c.imageUrl }}
+                     style={{ width: 76, height: 76, borderRadius: R.md,
+                              backgroundColor: C.bgAlt }} />
+            ) : (
+              <View style={{ width: 76, height: 76, borderRadius: R.md,
+                             backgroundColor: C.bgAlt, alignItems: 'center',
+                             justifyContent: 'center' }}>
+                <Camera color={C.inkSoft} size={22} />
+              </View>
+            )}
+            <View style={{ flex: 1, gap: 4 }}>
+              <Text style={[T.body, { fontFamily: 'Mukta_700Bold' }]} numberOfLines={2}>
+                {c.title || t('home.noDraftName')}
+              </Text>
+              <Text style={[T.body, { color: C.money, fontFamily: 'Mukta_700Bold' }]}>
+                {c.price ? money(c.price) : t('home.priceMissing')}
+              </Text>
+              <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 5 }}>
+                <StatusChip status={c.status} />
+                {c.marketplaces ? (
+                  <Pill tone="indigo"
+                        text={c.marketplaces === 1
+                          ? t('prod.onMarketplaces', { n: 1 })
+                          : t('prod.onMarketplacesPlural', { n: c.marketplaces })} />
+                ) : c.status !== 'draft' ? (
+                  <Pill text={t('prod.notSentYet')} tone="soft" />
+                ) : null}
+                {c.quantity <= 0 ? <Pill text={t('prod.outOfStock')} tone="warn" /> : null}
               </View>
             </View>
-            {live ? (
-              <Pressable onPress={() => Linking.openURL(live.url)}
-                         accessibilityLabel={t('prod.openListing')}>
-                <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6,
-                               marginTop: 4 }}>
-                  <Globe color={C.indigo} size={15} />
-                  <Text style={[T.micro, { color: C.indigo, flex: 1,
-                                           textDecorationLine: 'underline' }]}
-                        numberOfLines={1}>
-                    {live.url}
-                  </Text>
-                </View>
-              </Pressable>
+          </View>
+
+          {/* Counted facts only. `views` is null wherever nothing counts views, and
+              then the chip is simply absent rather than showing a zero. */}
+          <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 5, marginTop: 2 }}>
+            {c.viewsAvailable && c.views != null ? (
+              <Pill text={t('prod.viewsCount', { n: c.views })} tone="soft" />
             ) : null}
-          </Card>
-        );
-      })}
+            {c.sold ? <Pill text={t('prod.soldCount', { n: c.sold })} tone="good" /> : null}
+            {c.orders ? (
+              <Pill text={t('prod.ordersCount', { n: c.orders })} tone="soft" />
+            ) : null}
+            {c.revenue ? <Pill text={money(c.revenue)} tone="good" /> : null}
+            {c.updatedAt ? (
+              <Pill text={t('prod.updated', { ago: ago(t, c.updatedAt) })} tone="soft" />
+            ) : null}
+          </View>
+
+          {c.failedChannels.length ? (
+            <View style={{ flexDirection: 'row', gap: 6, alignItems: 'center' }}>
+              <Warning color={C.danger} size={15} />
+              <Text style={[T.micro, { flex: 1, color: C.danger }]} numberOfLines={1}>
+                {t('home.actPublishFailed', { what: c.failedChannels.join(', ') })}
+              </Text>
+            </View>
+          ) : null}
+        </Card>
+      ))}
     </TabScreen>
   );
 }

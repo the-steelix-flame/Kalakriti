@@ -6,15 +6,19 @@ import { Users, Check, Warning, Globe, Shield } from '../icons';
 import { TabScreen } from '../nav/Shell';
 import { useI18n, LANGUAGES } from '../i18n';
 import * as api from '../lib/api';
-import { apiBase, setApiBase, describeBackend } from '../lib/config';
+import * as session from '../lib/session';
+import * as cache from '../lib/cache';
 
 /**
  * Profile: who the artisan is, where they ship from, which marketplaces are ready,
- * and the two settings that actually matter on a phone (language and server).
+ * and the settings that belong to her rather than to us.
  *
- * The server field is here rather than buried in a separate screen because a release
- * APK cannot infer a LAN address, and being able to fix it on the device is the
- * difference between a working demo and a dead one.
+ * The "Server address" field that used to live here is gone. It let a developer point
+ * a build at a laptop, which is a real need - but it is a developer's need, and it was
+ * sitting in a screen used by somebody who has never seen a URL. The backend address
+ * is now build configuration (EXPO_PUBLIC_API_URL, see lib/config.ts), which is where
+ * environment settings belong. Nothing else on this screen exposes internals: no
+ * endpoints, no tokens, no build flags.
  */
 export default function ProfileTab({
   artisan, readiness, onLanguage, onLogin, onLogout, onEditProfile, onRefresh,
@@ -28,23 +32,8 @@ export default function ProfileTab({
   onRefresh: () => void;
 }) {
   const { t, native } = useI18n();
-  const [url, setUrl] = useState(apiBase());
-  const [checking, setChecking] = useState(false);
-  const [result, setResult] = useState<{ ok: boolean; text: string } | null>(null);
-
-  useEffect(() => { setUrl(apiBase()); }, [artisan]);
-
-  async function testServer() {
-    setChecking(true); setResult(null);
-    setApiBase(url || null);
-    try {
-      const h = await api.health();
-      setResult({ ok: true, text: t('prof.connected', { info: h?.llm ?? 'ok' }) });
-      onRefresh();
-    } catch {
-      setResult({ ok: false, text: t('prof.notConnected') });
-    } finally { setChecking(false); }
-  }
+  const [showInsights, setShowInsights] = useState(!session.insightsHidden());
+  const [cleared, setCleared] = useState(false);
 
   const pickup = artisan?.addresses?.find((a) => a.kind === 'pickup');
 
@@ -140,25 +129,34 @@ export default function ProfileTab({
         </View>
       </Card>
 
+      {/* Whether the Home page shows what other artisans are doing. Persisted, so
+          hiding it is permanent until she turns it back on - a preference that
+          reappears on every launch is not a preference. */}
+      <Card onPress={() => {
+        const next = !showInsights;
+        setShowInsights(next);
+        session.setInsightsHidden(!next);
+      }}>
+        <View style={{ flexDirection: 'row', alignItems: 'center', gap: S.md }}>
+          <Users color={C.inkMid} size={20} />
+          <Text style={[T.body, { flex: 1, fontFamily: 'Mukta_600SemiBold' }]}>
+            {t('prof.showInsights')}
+          </Text>
+          <Pill text={showInsights ? t('common.yes') : t('common.no')}
+                tone={showInsights ? 'good' : 'soft'} />
+        </View>
+      </Card>
+
       <Card>
-        <Text style={T.label}>{t('prof.serverAddress')}</Text>
-        <Field label="" value={url} onChange={setUrl}
-               placeholder="http://10.0.0.5:8000" />
-        <Text style={[T.micro, { fontSize: 12 }]}>
-          {t('prof.serverNow', { url: describeBackend() || t('common.offline') })}
-        </Text>
-        <Btn label={checking ? t('common.checking') : t('prof.testServer')}
-             tone="tonal" busy={checking} onPress={testServer} />
-        {result ? (
-          <View style={{ flexDirection: 'row', gap: S.sm, alignItems: 'center' }}>
-            {result.ok ? <Check color={C.money} size={17} />
-                       : <Warning color={C.danger} size={17} />}
-            <Text style={[T.bodySoft, { flex: 1,
-                  color: result.ok ? C.moneyDeep : C.danger }]}>{result.text}</Text>
-          </View>
-        ) : null}
+        <View style={{ flexDirection: 'row', alignItems: 'center', gap: S.sm }}>
+          <Shield color={C.inkMid} size={18} />
+          <Text style={[T.label, { flex: 1 }]}>{t('prof.storage')}</Text>
+        </View>
+        <Text style={[T.micro, { fontSize: 12 }]}>{t('prof.storageNote')}</Text>
         <Divider />
-        <Text style={[T.micro, { fontSize: 12 }]}>{t('prof.serverNote')}</Text>
+        <Btn label={cleared ? t('common.done') : t('prof.clearCache')} tone="ghost"
+             onPress={async () => { await cache.clear(); setCleared(true); onRefresh(); }} />
+        <Text style={[T.micro, { fontSize: 11.5 }]}>{t('prof.clearCacheNote')}</Text>
       </Card>
 
       <Card tone="indigo">

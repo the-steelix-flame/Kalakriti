@@ -1,5 +1,6 @@
 import React from 'react';
 import { View, Text, Pressable, ScrollView, Platform } from 'react-native';
+import type { RefreshControlProps } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { C, S, T, R, shadow } from '../theme';
 import { Home as HomeIcon, Tag, Rupee, Users, Globe } from '../icons';
@@ -103,7 +104,7 @@ export function TopBar({
 /* ───────────────────────────────────────────────────────────── tab screen */
 
 export function TabScreen({
-  title, subtitle, onLanguage, children, right, scroll = true,
+  title, subtitle, onLanguage, children, right, scroll = true, refreshControl, banner,
 }: {
   title: string;
   subtitle?: string;
@@ -111,6 +112,10 @@ export function TabScreen({
   right?: React.ReactNode;
   children: React.ReactNode;
   scroll?: boolean;
+  /** Pull-to-refresh. Every list is a cached copy, so re-pulling must be possible. */
+  refreshControl?: React.ReactElement<RefreshControlProps>;
+  /** Sits under the title bar, above the scroll: offline and unsent-work notices. */
+  banner?: React.ReactNode;
 }) {
   const insets = useSafeAreaInsets();
   // Content must clear the tab bar plus the home indicator, or the last card sits
@@ -120,11 +125,13 @@ export function TabScreen({
   return (
     <View style={{ flex: 1, backgroundColor: C.bg }}>
       <TopBar title={title} subtitle={subtitle} onLanguage={onLanguage} right={right} />
+      {banner}
       {scroll ? (
         <ScrollView
           contentContainerStyle={{ padding: S.lg, paddingBottom: bottomPad, gap: S.md }}
           showsVerticalScrollIndicator={false}
           keyboardShouldPersistTaps="handled"
+          refreshControl={refreshControl}
         >
           {children}
         </ScrollView>

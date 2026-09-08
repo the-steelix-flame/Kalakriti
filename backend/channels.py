@@ -328,3 +328,295 @@ def publish(channel: str, listing: dict) -> dict[str, Any]:
     if not fn:
         return _result("failed", error=f"unknown channel {channel}")
     return fn(listing)
+
+
+# ══════════════════════════════════════════════════════════════ statistics
+#
+# What each marketplace will actually tell us about a live listing.
+#
+# Deliberately conservative. Every metric below is either fetched from the platform's
+# own API or reported as unavailable with the reason. Nothing is estimated,
+# extrapolated, or filled in with a plausible-looking number - a made-up view count is
+# worse than none at all, because the artisan would price against it.
+#
+# The honest state of each platform:
+#
+#   storefront - we serve the page, so we count views ourselves (db.ListingView) and
+#                we hold the orders. Every metric is available except watchers, which
+#                the page has no feature for.
+#   amazon     - SP-API exposes no per-listing view or watcher metric. Traffic lives
+#                in Brand Analytics / Business Reports, which needs Brand Registry and
+#                a separate asynchronous report request. Orders and inventory are real
+#                calls and are made here.
+#   shopify    - Admin GraphQL gives inventory and orders. Views need the Analytics
+#                API under a read_analytics scope custom apps are rarely granted.
+#   ondc       - a transaction network, not an analytics platform. Beckn has no view
+#                or watcher concept at all. Order state arrives by callback.
+#   gem        - seller APIs cover catalogue, bids and orders; no traffic analytics.
+#
+# `available: False` with a `why` is a first-class answer here, not a failure.
+
+METRICS = ["views", "watchers", "sold", "inventory", "revenue", "orders"]
+
+
+def _metric(value=None, source=""):
+    return {"value": value, "available": True, "why": "", "source": source}
+
+
+def _none(why: str):
+    return {"value": None, "available": False, "why": why, "source": ""}
+
+
+def _all_unconfigured(name: str, missing: list[str]) -> dict[str, Any]:
+    why = f"{name} is not connected. Set {', '.join(missing)} to fetch real figures."
+    return {k: _none(why) for k in METRICS}
+
+
+def _amazon_token() -> str:
+    """LWA access token. Raises on failure so the caller reports the real reason."""
+    r = requests.post("https://api.amazon.com/auth/o2/token", timeout=TIMEOUT, data={
+        "grant_type": "refresh_token",
+        "refresh_token": os.getenv("AMZN_REFRESH_TOKEN"),
+        "client_id": os.getenv("AMZN_LWA_CLIENT_ID"),
+        "client_secret": os.getenv("AMZN_LWA_CLIENT_SECRET"),
+    })
+    if r.status_code != 200:
+        raise RuntimeError(f"LWA token HTTP {r.status_code}: {r.text[:160]}")
+    return r.json()["access_token"]
+
+
+def stats_storefront(pub, ctx) -> dict[str, Any]:
+    """Our own page: these are counted, not inferred."""
+    return {
+        "views": _metric(ctx.get("views", 0), "counted on /l/{id}, deduped per hour"),
+        "watchers": _none("The storefront page has no follow or watchlist feature, so "
+                          "there is nothing to count. It is not a missing integration."),
+        "sold": _metric(ctx.get("sold", 0), "orders table"),
+        "inventory": _metric(ctx.get("inventory"), "listing quantity"),
+        "revenue": _metric(ctx.get("revenue", 0), "paid orders"),
+        "orders": _metric(ctx.get("orders", 0), "orders table"),
+    }
+
+
+def stats_amazon(pub, ctx) -> dict[str, Any]:
+    miss = _missing("AMZN_LWA_CLIENT_ID", "AMZN_LWA_CLIENT_SECRET",
+                    "AMZN_REFRESH_TOKEN", "AMZN_SELLER_ID")
+    if miss:
+        return _all_unconfigured("Amazon", miss)
+
+    out = {
+        "views": _none("SP-API exposes no per-listing view count. Traffic sits behind "
+                       "the Business Reports / Brand Analytics API, which requires "
+                       "Brand Registry and an asynchronous report request."),
+        "watchers": _none("Amazon has no watcher concept for a seller listing."),
+    }
+    sku = pub.get("externalId") or pub.get("external_id") or ""
+    market = os.getenv("AMZN_MARKETPLACE_ID", "A21TJRUUN4KGV")
+    base = os.getenv("AMZN_SP_ENDPOINT", "https://sellingpartnerapi-eu.amazon.com")
+    try:
+        h = {"x-amz-access-token": _amazon_token(), "Accept": "application/json"}
+        inv = requests.get(f"{base}/fba/inventory/v1/summaries",
+                           params={"granularityType": "Marketplace",
+                                   "granularityId": market, "marketplaceIds": market,
+                                   "sellerSkus": sku},
+                           headers=h, timeout=TIMEOUT)
+        if inv.status_code < 300:
+            rows = (_safe_json(inv).get("payload", {}).get("inventorySummaries") or [])
+            out["inventory"] = _metric(
+                sum(int(r.get("totalQuantity") or 0) for r in rows),
+                "SP-API FBA Inventory")
+        else:
+            out["inventory"] = _none(
+                f"FBA Inventory API returned HTTP {inv.status_code}. This is expected "
+                f"for a merchant-fulfilled listing, which reports quantity through "
+                f"the Listings Items API instead.")
+
+        since = os.getenv("AMZN_ORDERS_SINCE", "2024-01-01T00:00:00Z")
+        od = requests.get(f"{base}/orders/v0/orders",
+                          params={"MarketplaceIds": market, "CreatedAfter": since},
+                          headers=h, timeout=TIMEOUT)
+        if od.status_code < 300:
+            items = (_safe_json(od).get("payload", {}).get("Orders") or [])
+            out["orders"] = _metric(len(items), "SP-API Orders v0")
+            out["revenue"] = _metric(
+                round(sum(float((o.get("OrderTotal") or {}).get("Amount") or 0)
+                          for o in items), 2), "SP-API Orders v0")
+            out["sold"] = _none(
+                "Units sold for one SKU needs a getOrderItems call per order. Not "
+                "fetched here because SP-API allows roughly one request per second and "
+                "it would exhaust the quota on a listing page.")
+        else:
+            for k in ("orders", "revenue", "sold"):
+                out[k] = _none(f"SP-API Orders returned HTTP {od.status_code}.")
+    except Exception as e:
+        for k in ("inventory", "orders", "revenue", "sold"):
+            out.setdefault(k, _none(f"{type(e).__name__}: {e}"))
+    for k in METRICS:
+        out.setdefault(k, _none("Not retrieved."))
+    return out
+
+
+def stats_shopify(pub, ctx) -> dict[str, Any]:
+    miss = _missing("SHOPIFY_STORE", "SHOPIFY_ACCESS_TOKEN")
+    if miss:
+        return _all_unconfigured("Shopify", miss)
+
+    out = {
+        "views": _none("Storefront traffic comes from the Shopify Analytics API under "
+                       "a read_analytics scope, which custom apps are rarely granted. "
+                       "This integration does not request it."),
+        "watchers": _none("Shopify has no watcher or follower metric on a product."),
+    }
+    gid = pub.get("externalId") or pub.get("external_id") or ""
+    store = os.getenv("SHOPIFY_STORE", "")
+    ver = os.getenv("SHOPIFY_API_VERSION", "2024-10")
+    hdr = {"X-Shopify-Access-Token": os.getenv("SHOPIFY_ACCESS_TOKEN", ""),
+           "Content-Type": "application/json"}
+    try:
+        r = requests.post(
+            f"https://{store}/admin/api/{ver}/graphql.json", headers=hdr, timeout=TIMEOUT,
+            json={"query": "query($id: ID!) { product(id: $id) { totalInventory } }",
+                  "variables": {"id": gid}})
+        prod = ((_safe_json(r).get("data") or {}).get("product") or {})
+        if r.status_code < 300 and prod:
+            out["inventory"] = _metric(prod.get("totalInventory"),
+                                       "Admin GraphQL product.totalInventory")
+        else:
+            out["inventory"] = _none(f"Admin API returned HTTP {r.status_code}.")
+    except Exception as e:
+        out["inventory"] = _none(f"{type(e).__name__}: {e}")
+
+    if os.getenv("SHOPIFY_READ_ORDERS"):
+        try:
+            r = requests.post(
+                f"https://{store}/admin/api/{ver}/graphql.json", headers=hdr,
+                timeout=TIMEOUT,
+                json={"query": """query($q: String!) { orders(first: 100, query: $q) {
+                        nodes { totalPriceSet { shopMoney { amount } }
+                                lineItems(first: 20) { nodes {
+                                  quantity product { id } } } } } }""",
+                      "variables": {"q": "financial_status:paid"}})
+            nodes = (((_safe_json(r).get("data") or {}).get("orders") or {})
+                     .get("nodes") or [])
+            mine = [o for o in nodes
+                    if any((li.get("product") or {}).get("id") == gid
+                           for li in ((o.get("lineItems") or {}).get("nodes") or []))]
+            out["orders"] = _metric(len(mine), "Admin GraphQL orders")
+            out["sold"] = _metric(
+                sum(li.get("quantity", 0)
+                    for o in mine
+                    for li in ((o.get("lineItems") or {}).get("nodes") or [])
+                    if (li.get("product") or {}).get("id") == gid),
+                "Admin GraphQL order line items")
+            out["revenue"] = _metric(
+                round(sum(float(((o.get("totalPriceSet") or {}).get("shopMoney") or {})
+                                .get("amount") or 0) for o in mine), 2),
+                "Admin GraphQL orders")
+        except Exception as e:
+            for k in ("orders", "sold", "revenue"):
+                out[k] = _none(f"{type(e).__name__}: {e}")
+    else:
+        why = ("Per-product sales need the read_orders scope. Set SHOPIFY_READ_ORDERS=1 "
+               "once your app has been granted it.")
+        for k in ("orders", "sold", "revenue"):
+            out[k] = _none(why)
+    for k in METRICS:
+        out.setdefault(k, _none("Not retrieved."))
+    return out
+
+
+def stats_ondc(pub, ctx) -> dict[str, Any]:
+    miss = _missing("ONDC_SUBSCRIBER_ID", "ONDC_SIGNING_PRIVATE_KEY", "ONDC_GATEWAY_URL")
+    if miss:
+        return _all_unconfigured("ONDC", miss)
+    why = ("ONDC is a transaction network, not an analytics platform. Beckn carries "
+           "search, order and fulfilment messages and has no concept of a listing "
+           "view or a watcher, so no seller can obtain these numbers.")
+    return {
+        "views": _none(why),
+        "watchers": _none(why),
+        "orders": _metric(ctx.get("orders", 0), "on_confirm callbacks to this backend"),
+        "sold": _metric(ctx.get("sold", 0), "on_confirm callbacks"),
+        "revenue": _metric(ctx.get("revenue", 0), "on_confirm callbacks"),
+        "inventory": _metric(ctx.get("inventory"), "listing quantity"),
+    }
+
+
+def stats_gem(pub, ctx) -> dict[str, Any]:
+    miss = _missing("GEM_API_KEY", "GEM_SELLER_ID", "GEM_API_BASE")
+    if miss:
+        return _all_unconfigured("GeM", miss)
+    why = ("GeM seller APIs cover catalogue, bids and orders. There is no public "
+           "endpoint for listing traffic or watchers.")
+    out = {"views": _none(why), "watchers": _none(why),
+           "inventory": _metric(ctx.get("inventory"), "listing quantity")}
+    try:
+        r = requests.get(
+            f"{os.getenv('GEM_API_BASE', '').rstrip('/')}/seller/orders",
+            params={"sellerId": os.getenv("GEM_SELLER_ID"),
+                    "productId": pub.get("externalId") or pub.get("external_id") or ""},
+            headers={"Authorization": f"Bearer {os.getenv('GEM_API_KEY')}"},
+            timeout=TIMEOUT)
+        if r.status_code < 300:
+            rows = _safe_json(r).get("orders") or []
+            out["orders"] = _metric(len(rows), "GeM seller orders")
+            out["sold"] = _metric(sum(int(o.get("quantity") or 0) for o in rows),
+                                  "GeM seller orders")
+            out["revenue"] = _metric(
+                round(sum(float(o.get("amount") or 0) for o in rows), 2),
+                "GeM seller orders")
+        else:
+            for k in ("orders", "sold", "revenue"):
+                out[k] = _none(f"GeM orders endpoint returned HTTP {r.status_code}.")
+    except Exception as e:
+        for k in ("orders", "sold", "revenue"):
+            out[k] = _none(f"{type(e).__name__}: {e}")
+    for k in METRICS:
+        out.setdefault(k, _none("Not retrieved."))
+    return out
+
+
+STATS_ADAPTERS = {
+    "storefront": stats_storefront,
+    "amazon": stats_amazon,
+    "shopify": stats_shopify,
+    "ondc": stats_ondc,
+    "gem": stats_gem,
+}
+
+
+def stats(channel: str, pub: dict, ctx: dict | None = None) -> dict[str, Any]:
+    """
+    Real figures for one published listing on one channel.
+
+    `ctx` carries what this backend knows for certain - its own order rows and its own
+    counted storefront views. An adapter uses it only where that genuinely is the
+    source of truth (we serve the storefront; ONDC order state arrives here by
+    callback), never to paper over a metric the platform does not expose.
+    """
+    fn = STATS_ADAPTERS.get(channel)
+    if not fn:
+        return _all_unconfigured(channel, [])
+    try:
+        return fn(pub, ctx or {})
+    except Exception as e:
+        return {k: _none(f"{type(e).__name__}: {e}") for k in METRICS}
+
+
+def metric_support() -> dict[str, dict[str, bool]]:
+    """
+    Which metrics each channel can ever provide, regardless of credentials. The app
+    uses this to explain a blank as a platform limit rather than a setup mistake.
+    """
+    return {
+        "storefront": {"views": True, "watchers": False, "sold": True,
+                       "inventory": True, "revenue": True, "orders": True},
+        "amazon": {"views": False, "watchers": False, "sold": False,
+                   "inventory": True, "revenue": True, "orders": True},
+        "shopify": {"views": False, "watchers": False, "sold": True,
+                    "inventory": True, "revenue": True, "orders": True},
+        "ondc": {"views": False, "watchers": False, "sold": True,
+                 "inventory": True, "revenue": True, "orders": True},
+        "gem": {"views": False, "watchers": False, "sold": True,
+                "inventory": True, "revenue": True, "orders": True},
+    }

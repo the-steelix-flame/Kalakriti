@@ -1,52 +1,74 @@
+/**
+ * Orders, with the filters and sorts the brief asks for.
+ *
+ * Filters follow the real order lifecycle stored in the database, so a chip always
+ * corresponds to a state the backend can actually be in - there is no "Processing"
+ * chip that quietly means several different things.
+ *
+ * The "book the courier" action appears only on a paid order, because that is the
+ * precondition the backend enforces. Offering it earlier would be a button that
+ * always fails, which teaches the artisan the app is unreliable.
+ */
 import React, { useMemo, useState } from 'react';
-import { View, Text, Pressable, Linking } from 'react-native';
+import { View, Text, Pressable, Linking, RefreshControl } from 'react-native';
 import { Card, Btn, Pill, Row, StatusChip, Skeleton, Divider, money } from '../ui';
+import { FilterBar, applyList, byDate, byNum, FilterDef, SortDef } from '../ui/Filters';
 import { C, S, T, R } from '../theme';
 import { Rupee, Globe, Warning } from '../icons';
 import { TabScreen } from '../nav/Shell';
 import { useI18n } from '../i18n';
+import { ago } from '../lib/ago';
 import * as api from '../lib/api';
 
-/**
- * Orders, grouped by the stage the artisan actually has to act on.
- *
- * The "book the courier" action only appears for a paid order, because that is the
- * real precondition the backend enforces - offering it earlier would be a button
- * that always fails.
- */
-const FILTERS = [
-  { key: 'new', label: 'ord.new',
-    match: (o: api.Order) => ['created', 'payment_pending', 'paid'].includes(o.status) },
-  { key: 'processing', label: 'ord.processing',
-    match: (o: api.Order) => ['confirmed', 'packed'].includes(o.status) },
-  { key: 'shipped', label: 'ord.shipped',
-    match: (o: api.Order) => ['shipped', 'out_for_delivery'].includes(o.status) },
-  { key: 'delivered', label: 'ord.delivered',
-    match: (o: api.Order) => ['delivered', 'completed'].includes(o.status) },
-  { key: 'returns', label: 'ord.returns',
-    match: (o: api.Order) => ['cancelled', 'refunded', 'failed'].includes(o.status) },
+const FILTERS: FilterDef<api.Order>[] = [
+  { key: 'all', label: 'prod.all', match: () => true },
+  { key: 'pending', label: 'ord.filterPending',
+    match: (o) => ['created', 'payment_pending'].includes(o.status) },
+  { key: 'paid', label: 'ord.filterPaid',
+    match: (o) => o.status === 'paid' || (o.paymentStatus === 'paid'
+                    && o.status === 'confirmed') },
+  { key: 'processing', label: 'ord.filterProcessing',
+    match: (o) => ['confirmed', 'packed'].includes(o.status) },
+  { key: 'shipped', label: 'ord.filterShipped',
+    match: (o) => ['shipped', 'out_for_delivery'].includes(o.status) },
+  { key: 'delivered', label: 'ord.filterDelivered',
+    match: (o) => ['delivered', 'completed'].includes(o.status) },
+  { key: 'cancelled', label: 'ord.filterCancelled',
+    match: (o) => ['cancelled', 'failed'].includes(o.status) },
+  { key: 'returned', label: 'ord.filterReturned', match: (o) => o.status === 'refunded' },
+];
+
+const SORTS: SortDef<api.Order>[] = [
+  { key: 'newest', label: 'sort.newest', cmp: byDate((o) => o.createdAt, 1) },
+  { key: 'oldest', label: 'sort.oldest', cmp: byDate((o) => o.createdAt, -1) },
+  { key: 'valueHigh', label: 'sort.valueHigh', cmp: byNum((o) => o.amount, 1) },
+  { key: 'valueLow', label: 'sort.valueLow', cmp: byNum((o) => o.amount, -1) },
 ];
 
 export default function OrdersTab({
-  orders, loading, artisan, onLanguage, onRefresh, onShip, onLogin,
+  orders, loading, artisan, offline, onLanguage, onRefresh, onShip, onLogin, onOpenProduct,
 }: {
   orders: api.Order[];
   loading: boolean;
   artisan: api.Artisan | null;
+  offline: boolean;
   onLanguage: () => void;
   onRefresh: () => void;
   onShip: (id: string) => Promise<void>;
   onLogin: () => void;
+  onOpenProduct?: (id: string) => void;
 }) {
   const { t } = useI18n();
-  const [filter, setFilter] = useState('new');
+  const [filter, setFilter] = useState('all');
+  const [sort, setSort] = useState('newest');
   const [shipping, setShipping] = useState<string | null>(null);
 
-  const shown = useMemo(() => {
-    const f = FILTERS.find((x) => x.key === filter) ?? FILTERS[0];
-    return orders.filter(f.match);
-  }, [orders, filter]);
+  const shown = useMemo(
+    () => applyList(orders, FILTERS, filter, SORTS, sort),
+    [orders, filter, sort]);
 
+  // An order belongs to an account. A guest has no account, so there is genuinely
+  // nothing to show - and saying why is better than an empty list.
   if (!artisan) {
     return (
       <TabScreen title={t('ord.title')} onLanguage={onLanguage}>
@@ -64,32 +86,17 @@ export default function OrdersTab({
   }
 
   return (
-    <TabScreen title={t('ord.title')} onLanguage={onLanguage}
-               right={<Pressable onPress={onRefresh} hitSlop={10}
-                                 accessibilityLabel={t('create.refresh')}>
-                        <Pill text={t('create.refresh')} />
-                      </Pressable>}>
-      <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 6 }}>
-        {FILTERS.map((f) => {
-          const on = filter === f.key;
-          const n = orders.filter(f.match).length;
-          return (
-            <Pressable key={f.key} onPress={() => setFilter(f.key)}
-                       accessibilityLabel={t(f.label)}>
-              <View style={{ paddingHorizontal: 13, paddingVertical: 8,
-                             borderRadius: R.pill,
-                             backgroundColor: on ? C.ink : C.bgAlt }}>
-                <Text style={{ fontFamily: 'Mukta_600SemiBold', fontSize: 13.5,
-                               color: on ? C.white : C.inkMid }}>
-                  {t(f.label)}{n ? ` · ${n}` : ''}
-                </Text>
-              </View>
-            </Pressable>
-          );
-        })}
-      </View>
+    <TabScreen
+      title={t('ord.title')}
+      subtitle={offline ? t('sync.offline') : undefined}
+      onLanguage={onLanguage}
+      refreshControl={<RefreshControl refreshing={loading} onRefresh={onRefresh}
+                                      tintColor={C.primary} />}
+    >
+      <FilterBar items={orders} filters={FILTERS} filter={filter} onFilter={setFilter}
+                 sorts={SORTS} sort={sort} onSort={setSort} />
 
-      {loading ? (
+      {loading && !orders.length ? (
         <><Card><Skeleton h={54} /></Card><Card><Skeleton h={54} /></Card></>
       ) : shown.length === 0 ? (
         <Card style={{ alignItems: 'center', paddingVertical: S.xl, gap: S.sm }}>
@@ -98,24 +105,36 @@ export default function OrdersTab({
                          justifyContent: 'center' }}>
             <Rupee color={C.inkSoft} size={24} />
           </View>
-          <Text style={T.body}>{t('ord.empty')}</Text>
-          <Text style={[T.bodySoft, { textAlign: 'center' }]}>{t('ord.emptySub')}</Text>
+          <Text style={T.body}>
+            {orders.length ? t('prod.emptyFiltered') : t('ord.empty')}
+          </Text>
+          {!orders.length ? (
+            <Text style={[T.bodySoft, { textAlign: 'center' }]}>{t('ord.emptySub')}</Text>
+          ) : null}
         </Card>
       ) : shown.map((o) => {
         const canShip = o.paymentStatus === 'paid'
           && ['paid', 'confirmed', 'packed'].includes(o.status);
         return (
-          <Card key={o.id}>
+          <Card key={o.id}
+                onPress={onOpenProduct ? () => onOpenProduct(o.listingId) : undefined}>
             <View style={{ flexDirection: 'row', alignItems: 'center', gap: S.sm }}>
-              <Text style={[T.body, { fontFamily: 'Mukta_700Bold', flex: 1 }]}
-                    numberOfLines={1}>
-                {o.buyerName || t('ord.buyer')}
-              </Text>
+              <View style={{ flex: 1 }}>
+                <Text style={[T.body, { fontFamily: 'Mukta_700Bold' }]} numberOfLines={1}>
+                  {o.buyerName || t('ord.buyer')}
+                </Text>
+                <Text style={[T.micro, { fontSize: 12 }]}>
+                  {t('ord.from', { name: o.channel })} · {ago(t, o.createdAt)}
+                </Text>
+              </View>
               <StatusChip status={o.status} />
             </View>
+
             <Row label={t('ord.amount')} value={money(o.amount)} strong />
+            <Row label={t('ord.quantity')} value={String(o.quantity)} />
             <Row label={t('ord.payment')} value={o.paymentStatus} />
             {o.buyerPhone ? <Row label={t('prof.phone')} value={o.buyerPhone} /> : null}
+
             {o.trackingId ? (
               <>
                 <Divider />
@@ -133,17 +152,16 @@ export default function OrdersTab({
                 ) : null}
               </>
             ) : null}
+
             {canShip ? (
-              <Btn
-                label={shipping === o.id ? t('ord.shipping') : t('ord.ship')}
-                tone="money"
-                busy={shipping === o.id}
-                onPress={async () => {
-                  setShipping(o.id);
-                  try { await onShip(o.id); } finally { setShipping(null); }
-                }}
-              />
+              <Btn label={shipping === o.id ? t('ord.shipping') : t('ord.ship')}
+                   tone="money" busy={shipping === o.id}
+                   onPress={async () => {
+                     setShipping(o.id);
+                     try { await onShip(o.id); } finally { setShipping(null); }
+                   }} />
             ) : null}
+
             {o.paymentStatus !== 'paid' && o.status !== 'cancelled' ? (
               <View style={{ flexDirection: 'row', gap: 6, alignItems: 'center' }}>
                 <Warning color={C.gold} size={15} />

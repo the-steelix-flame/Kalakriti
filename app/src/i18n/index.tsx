@@ -12,7 +12,9 @@
  *  3. Changing the language did not re-render. The provider sits above the whole
  *     tree, so a change is immediate everywhere.
  */
-import React, { createContext, useCallback, useContext, useMemo, useState } from 'react';
+import React, {
+  createContext, useCallback, useContext, useEffect, useMemo, useState,
+} from 'react';
 import { EN, HI, StringKey } from './catalog';
 import * as session from '../lib/session';
 
@@ -70,14 +72,25 @@ const I18nCtx = createContext<Ctx>({
   native: 'हिन्दी',
 });
 
-function initialLang(): Lang {
+function storedLang(): Lang | null {
   const stored = session.getLang() as Lang | null;
-  if (stored && LANGUAGES.some((l) => l.code === stored)) return stored;
-  return 'hi';
+  return stored && LANGUAGES.some((l) => l.code === stored) ? stored : null;
 }
 
 export function I18nProvider({ children }: { children: React.ReactNode }) {
-  const [lang, setLangState] = useState<Lang>(initialLang);
+  // Storage is asynchronous on a phone, so the chosen language is not known at the
+  // first render. It is read here as soon as it is available; the brief moment before
+  // that shows Hindi, which is the onboarding default anyway.
+  const [lang, setLangState] = useState<Lang>(() => storedLang() ?? 'hi');
+
+  useEffect(() => {
+    let alive = true;
+    session.hydrate().then(() => {
+      const l = storedLang();
+      if (alive && l) setLangState(l);
+    });
+    return () => { alive = false; };
+  }, []);
 
   const setLang = useCallback((l: Lang) => {
     setLangState(l);

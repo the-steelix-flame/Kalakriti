@@ -405,6 +405,76 @@ def log_event(s, subject_type: str, subject_id: str, kind: str,
                 frm=frm, to=to, detail=detail, payload=payload or {}))
 
 
+class ListingView(Base):
+    """
+    A real page view of a storefront listing.
+
+    One row per request to /l/{id}, deduplicated per viewer per hour so a buyer
+    refreshing the page does not manufacture traffic. The viewer key is a salted
+    hash of IP + user agent: enough to count distinct people, not enough to identify
+    one. This is the only view metric in the system that we generate ourselves, and
+    it is counted rather than estimated.
+
+    Views on external marketplaces are NOT stored here - they are fetched from that
+    marketplace's own API at read time, and reported as unavailable when its API does
+    not expose them. See channels.stats().
+    """
+    __tablename__ = "listing_views"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    listing_id = Column(String, ForeignKey("listings.id"), index=True)
+    viewer_key = Column(String, index=True)
+    referrer = Column(String, default="")
+    at = Column(DateTime, default=now, index=True)
+
+
+class Enquiry(Base):
+    """
+    A buyer asking about a larger or custom order.
+
+    This replaces the old "Samuh" screen, which displayed an invented consortium of
+    fictional artisans. An enquiry here is a real message from a real form on the
+    listing page: somebody wanting 200 pieces, or a variation, or a wholesale price.
+    Aggregating artisans to fill one large order is a genuinely useful idea, but it
+    cannot be shown as though it were happening when no such network exists.
+    """
+    __tablename__ = "enquiries"
+    id = Column(String, primary_key=True)
+    listing_id = Column(String, ForeignKey("listings.id"), index=True)
+    artisan_id = Column(String, ForeignKey("artisans.id"), index=True, nullable=True)
+    channel = Column(String, default="storefront")
+
+    buyer_name = Column(String, default="")
+    buyer_phone = Column(String, default="")
+    buyer_email = Column(String, default="")
+    organisation = Column(String, default="")
+
+    quantity = Column(Integer, default=0)
+    target_price = Column(Float, default=0)
+    needed_by = Column(String, default="")
+    message = Column(Text, default="")
+
+    status = Column(String, default="new")   # new | replied | quoted | won | lost
+    reply = Column(Text, default="")
+    created_at = Column(DateTime, default=now)
+    updated_at = Column(DateTime, default=now, onupdate=now)
+
+    def public(self) -> dict:
+        return {
+            "id": self.id, "listingId": self.listing_id, "channel": self.channel,
+            "buyerName": self.buyer_name, "buyerPhone": self.buyer_phone,
+            "buyerEmail": self.buyer_email, "organisation": self.organisation,
+            "quantity": self.quantity, "targetPrice": self.target_price,
+            "neededBy": self.needed_by, "message": self.message,
+            "status": self.status, "reply": self.reply,
+            "createdAt": self.created_at.isoformat() if self.created_at else None,
+            "updatedAt": self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+ENQUIRY_FLOW = ["new", "replied", "quoted", "won"]
+ENQUIRY_TERMINAL = ["lost"]
+
+
 def init() -> None:
     Base.metadata.create_all(engine)
 

@@ -65,7 +65,7 @@ const post = <T,>(p: string, body: any, ms?: number) =>
   call<T>(p, { method: 'POST', body: JSON.stringify(body) }, ms);
 const patch = <T,>(p: string, body: any) =>
   call<T>(p, { method: 'PATCH', body: JSON.stringify(body) });
-const get = <T,>(p: string) => call<T>(p);
+const get = <T,>(p: string, ms?: number) => call<T>(p, undefined, ms);
 
 /* --------------------------------------------------------------- types */
 
@@ -164,9 +164,18 @@ export const suggestPrice = (b: {
 }) => post<PriceAdvice>('/v1/price', b, 600000);
 
 export const getListing = (id: string) => get<Listing & { events: any[] }>(`/v1/listings/${id}`);
-export const listListings = () => get<{ listings: Listing[] }>('/v1/listings');
-export const updateListing = (id: string, body: Partial<Listing>) =>
-  patch<Listing>(`/v1/listings/${id}`, body);
+export const listListings = () =>
+  get<{ listings: Listing[]; cards: Card[] }>('/v1/listings');
+/**
+ * Save an edit. `baseUpdatedAt` is the version of the row the artisan was looking
+ * at; the server uses it to detect that the row moved while this edit sat in the
+ * offline queue, and returns per-field conflicts instead of overwriting blindly.
+ */
+export const updateListing = (
+  id: string,
+  body: Partial<Listing> & { baseUpdatedAt?: string | null },
+) => patch<Listing & { conflicts?: { field: string; mine: any; theirs: any }[] }>(
+  `/v1/listings/${id}`, body);
 
 export const publishListing = (id: string, chans: string[]) =>
   post<{ listing: Listing; publications: Publication[] }>(
@@ -254,3 +263,101 @@ export const mapping = (channel: string) =>
 
 export const shipOrder = (oid: string) =>
   post<{ shipment: any; order: Order }>(`/v1/orders/${oid}/ship`, {}, 120000);
+
+/* ───────────────────────────────────── product cards, marketplaces, insight */
+
+/**
+ * One metric from one marketplace.
+ *
+ * `available: false` is a real answer, not an error. Amazon does not give a seller
+ * application a per-listing view count and ONDC has no view concept at all, so those
+ * arrive with `available: false` and a `why` the app shows verbatim. Rendering a zero
+ * instead would tell the artisan nobody looked, which is a different and false claim.
+ */
+export type Metric = {
+  value: number | null;
+  available: boolean;
+  why: string;
+  source: string;
+};
+
+export type Stats = Record<'views' | 'watchers' | 'sold' | 'inventory' | 'revenue'
+                           | 'orders', Metric>;
+
+/** A row of My Products: counted from real rows, never estimated. */
+export type Card = {
+  id: string;
+  title: string; titleEn: string;
+  imageUrl: string;
+  price: number; currency: string; quantity: number; category: string;
+  status: string;            // includes derived states: partial, failed
+  rawStatus: string;
+  marketplaces: number; marketplacesAttempted: number;
+  channels: string[]; failedChannels: string[];
+  views: number | null; viewsAvailable: boolean;
+  orders: number; sold: number; revenue: number;
+  updatedAt?: string; createdAt?: string;
+};
+
+export type MarketplaceRow = Publication & {
+  channelName: string;
+  supports: Record<string, boolean>;
+  localOrders: { orders: number; sold: number; revenue: number;
+                 pending: number; toShip: number };
+  orderCount: number;
+  stats?: Stats;
+};
+
+export type ProductDetail = {
+  listing: Listing;
+  card: Card;
+  marketplaces: MarketplaceRow[];
+  orders: Order[];
+  events: any[];
+};
+
+export type Summary = {
+  authenticated: boolean;
+  drafts?: Card[];
+  products?: { total: number; byStatus: Record<string, number>; live: number;
+               drafts: number; sold: number };
+  orders?: { orders: number; sold: number; revenue: number; pending: number;
+             toShip: number };
+  storefrontViews?: number;
+  newEnquiries?: number;
+  actions?: { kind: string; listingId?: string; orderId?: string; title: string;
+              image?: string; detail?: string; amount?: number }[];
+  actionCount?: number;
+  watched?: Card[];
+  best?: Card[];
+};
+
+export type Insights = {
+  enough: boolean;
+  minCohort: number;
+  categories: { category: string; listings: number; artisans: number;
+                priceLow: number; priceHigh: number; median: number;
+                yours: boolean }[];
+  basis: string;
+  note: string;
+};
+
+export type Enquiry = {
+  id: string; listingId: string; channel: string;
+  buyerName: string; buyerPhone: string; buyerEmail: string; organisation: string;
+  quantity: number; targetPrice: number; neededBy: string; message: string;
+  status: string; reply: string;
+  productTitle?: string;
+  createdAt?: string; updatedAt?: string;
+};
+
+export const summary = () => get<Summary>('/v1/summary');
+export const insights = () => get<Insights>('/v1/insights');
+export const productDetail = (id: string) => get<ProductDetail>(`/v1/listings/${id}/detail`);
+export const marketplaceDetail = (id: string, channel: string) =>
+  get<{ listingId: string; marketplace: MarketplaceRow; orders: Order[]; events: any[] }>(
+    `/v1/listings/${id}/marketplaces/${channel}`, 120000);
+
+export const listEnquiries = () => get<{ enquiries: Enquiry[] }>('/v1/enquiries');
+export const replyEnquiry = (id: string, body: { reply?: string; status?: string }) =>
+  patch<Enquiry>(`/v1/enquiries/${id}`, body);

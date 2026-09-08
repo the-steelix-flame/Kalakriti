@@ -20,6 +20,7 @@ import GuidedCamera from './GuidedCamera';
 import { ShotPlan } from './shotPlan';
 import { CATEGORIES, CategoryKey } from '../vision/guidance';
 import { useI18n } from '../i18n';
+import { useStore } from '../lib/store';
 import { listen, isSupported, LANGS, Listener } from '../lib/speech';
 
 /**
@@ -75,6 +76,9 @@ export default function Create({
   const [partial, setPartial] = useState('');
   const [recording, setRecording] = useState(false);
   const { t, locale } = useI18n();
+  const store = useStore();
+  /** The row version the current edits were made against. */
+  const baseVersion = useRef<string | null>(null);
   const insets = useSafeAreaInsets();
   const [lang, setLang] = useState(locale);
   useEffect(() => { setLang(locale); }, [locale]);
@@ -145,21 +149,30 @@ export default function Create({
         } as api.AnalyzeOut);
       }
       if (l.publications?.length) setPubs(l.publications);
+      // Remember which version these edits are being made against, so an edit that
+      // sits in the offline queue can be merged rather than blindly replayed.
+      baseVersion.current = l.updatedAt ?? null;
     }).catch(() => session.setDraft(null));
   }, [resumeId]);
 
   useEffect(() => { if (listingId) session.setDraft(listingId); }, [listingId]);
 
-  // Mirror edits to the backend so a refresh never loses work. Debounced so typing
-  // does not fire a request per keystroke.
+  // Mirror edits so a refresh never loses work. Debounced, because typing must not
+  // fire a request per keystroke.
+  //
+  // This goes through the write queue rather than calling the API directly. The old
+  // version did `api.updateListing(...).catch(() => {})`, which meant that an edit
+  // made with no signal was swallowed silently - the artisan would fill in a price on
+  // a patchy connection, see nothing wrong, and find it gone. Queued, the edit is
+  // held on the device and replayed when the connection returns.
   const saveTimer = useRef<any>(null);
   const persist = useCallback((patch: Partial<api.Listing>) => {
     if (!listingId) return;
     clearTimeout(saveTimer.current);
     saveTimer.current = setTimeout(() => {
-      api.updateListing(listingId, patch).catch(() => {});
+      store.editListing(listingId, patch as Record<string, any>, baseVersion.current);
     }, 700);
-  }, [listingId]);
+  }, [listingId, store]);
 
   useEffect(() => {
     if (!listingId) return;

@@ -26,7 +26,7 @@ import html
 import io
 import json
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from dotenv import load_dotenv
@@ -37,6 +37,7 @@ from pydantic import BaseModel
 
 load_dotenv()
 
+import analytics  # noqa: E402
 import auth  # noqa: E402
 import bg  # noqa: E402
 import channels  # noqa: E402
@@ -407,6 +408,8 @@ def price(body: PriceIn) -> dict[str, Any]:
 # ══════════════════════════════════════════════════════════ 3. listings CRUD
 
 class ListingPatch(BaseModel):
+    # The row version this edit was made against, for offline replay. See patch_listing.
+    baseUpdatedAt: str | None = None
     titleEn: str | None = None
     titleHi: str | None = None
     descEn: str | None = None
@@ -443,54 +446,183 @@ def list_listings(limit: int = 50,
                          db.Listing.artisan_id.is_(None))
         else:
             return {"listings": []}
-        rows = q.order_by(db.Listing.created_at.desc()).limit(limit).all()
-        return {"listings": [r.public() for r in rows]}
+        rows = q.order_by(db.Listing.updated_at.desc()).limit(limit).all()
+        return {"listings": [r.public() for r in rows],
+                "cards": [analytics.listing_card(s, r) for r in rows]}
     finally:
         s.close()
 
 
+def _own_listing(s, lid: str, authorization, x_guest_token):
+    """
+    Fetch a listing the caller is entitled to see.
+
+    Previously any id could be read or edited by anyone who guessed it, which leaks a
+    seller's unpublished drafts, costs and buyer orders. A guest may reach only the
+    drafts made on their own device, and only while those drafts have no owner.
+    """
+    lst = s.get(db.Listing, lid)
+    if not lst:
+        raise HTTPException(404, "listing not found")
+    me = auth.artisan_from_token(s, authorization)
+    if me and lst.artisan_id == me.id:
+        return lst, me
+    if lst.artisan_id is None and x_guest_token and lst.guest_token == x_guest_token:
+        return lst, me
+    raise HTTPException(403, "this product belongs to another seller")
+
+
 @app.get("/v1/listings/{lid}")
-def get_listing(lid: str) -> dict[str, Any]:
+def get_listing(lid: str,
+                authorization: str | None = Header(None),
+                x_guest_token: str | None = Header(None)) -> dict[str, Any]:
     s = db.session()
     try:
-        lst = s.get(db.Listing, lid)
-        if not lst:
-            raise HTTPException(404, "listing not found")
+        lst, _ = _own_listing(s, lid, authorization, x_guest_token)
         evs = (s.query(db.Event).filter(db.Event.subject_id == lid)
                .order_by(db.Event.at.asc()).all())
-        return {**lst.public(), "events": [e.public() for e in evs]}
+        return {**lst.public(), "events": [e.public() for e in evs],
+                "views": analytics.view_count(s, lid)}
+    finally:
+        s.close()
+
+
+@app.get("/v1/listings/{lid}/detail")
+def listing_detail(lid: str,
+                   authorization: str | None = Header(None),
+                   x_guest_token: str | None = Header(None)) -> dict[str, Any]:
+    """
+    Everything the product page shows: the product, where it was sent, and what each
+    marketplace reports. Marketplace figures are not fetched here - that costs a round
+    trip per channel against rate-limited APIs - so this stays fast enough to open on
+    a tap. The marketplace screen fetches live figures for the one channel it shows.
+    """
+    s = db.session()
+    try:
+        lst, _ = _own_listing(s, lid, authorization, x_guest_token)
+        evs = (s.query(db.Event)
+               .filter(db.Event.subject_id.in_(
+                   [lid] + [p.id for p in lst.publications]
+                   + [o.id for o in lst.orders]))
+               .order_by(db.Event.at.desc()).limit(60).all())
+        return {
+            "listing": lst.public(),
+            "card": analytics.listing_card(s, lst),
+            "marketplaces": analytics.marketplace_rows(s, lst, live=False),
+            "orders": [o.public() for o in lst.orders],
+            "events": [e.public() for e in evs],
+        }
+    finally:
+        s.close()
+
+
+@app.get("/v1/listings/{lid}/marketplaces/{channel}")
+def marketplace_detail(lid: str, channel: str,
+                       authorization: str | None = Header(None),
+                       x_guest_token: str | None = Header(None)) -> dict[str, Any]:
+    """
+    One product on one marketplace, with live figures fetched from that platform.
+
+    Metrics a platform does not expose come back as `available: false` with the
+    reason - Amazon has no per-listing view count for a seller application, ONDC has
+    no view concept at all - rather than a zero, which would read as "nobody looked".
+    """
+    s = db.session()
+    try:
+        lst, _ = _own_listing(s, lid, authorization, x_guest_token)
+        rows = analytics.marketplace_rows(s, lst, live=True)
+        row = next((r for r in rows if r["channel"] == channel), None)
+        if not row:
+            raise HTTPException(404, "this product was not sent to that marketplace")
+        orders = [o.public() for o in lst.orders if o.channel == channel]
+        evs = (s.query(db.Event).filter(db.Event.subject_id == row["id"])
+               .order_by(db.Event.at.desc()).limit(40).all())
+        return {"listingId": lid, "marketplace": row, "orders": orders,
+                "events": [e.public() for e in evs]}
     finally:
         s.close()
 
 
 @app.patch("/v1/listings/{lid}")
-def patch_listing(lid: str, body: ListingPatch) -> dict[str, Any]:
+def patch_listing(lid: str, body: ListingPatch,
+                  authorization: str | None = Header(None),
+                  x_guest_token: str | None = Header(None)) -> dict[str, Any]:
     """
     Every field stays editable right up to submission. The artisan's edit always wins
     over anything a model produced.
+
+    Offline edits arrive here late, carrying `baseUpdatedAt` - the version of the row
+    the artisan was actually looking at when she typed. If the row has moved since,
+    only the fields that both sides changed are in conflict; those keep the server
+    value and are returned in `conflicts`, and everything else applies normally. The
+    alternative, last-write-wins, would silently throw away whichever side lost, and
+    both sides here are somebody's real work.
     """
     s = db.session()
     try:
-        lst = s.get(db.Listing, lid)
-        if not lst:
-            raise HTTPException(404, "listing not found")
+        lst, _ = _own_listing(s, lid, authorization, x_guest_token)
         m = {"titleEn": "title_en", "titleHi": "title_hi", "descEn": "desc_en",
              "descHi": "desc_hi", "category": "category", "hsn": "hsn", "price": "price",
              "floorPrice": "floor_price", "quantity": "quantity", "tags": "tags",
              "attributes": "attributes", "transcript": "transcript"}
+
+        # SQLite hands back naive datetimes, and the client echoes whatever it was
+        # given, so both sides are normalised to UTC before they are compared. The one
+        # second of slack absorbs the sub-second difference between the value the
+        # client read and the value the database rounded on write; without it every
+        # edit would look stale against itself.
+        def _utc(dt):
+            return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt
+
+        # Which fields somebody else changed after the version this edit was made
+        # against. The event log already records every edit as "edited: a, b", so it
+        # is the history we need - and using it is what makes the merge field-level
+        # rather than row-level. Comparing values instead would flag every field the
+        # artisan changed offline as a conflict with itself.
+        moved: set[str] = set()
+        if body.baseUpdatedAt:
+            try:
+                base = _utc(datetime.fromisoformat(
+                    body.baseUpdatedAt.replace("Z", "+00:00")))
+                later = (s.query(db.Event)
+                         .filter(db.Event.subject_id == lid,
+                                 db.Event.subject_type == "listing")
+                         .all())
+                for ev in later:
+                    if not ev.at or _utc(ev.at) <= base + timedelta(seconds=1):
+                        continue
+                    if (ev.detail or "").startswith("edited: "):
+                        moved.update(f.strip()
+                                     for f in ev.detail[len("edited: "):].split(","))
+            except ValueError:
+                moved = set()
+
+        conflicts = []
         changed = []
         for k, col in m.items():
             v = getattr(body, k)
-            if v is not None:
-                setattr(lst, col, v)
-                changed.append(k)
+            if v is None:
+                continue
+            current = getattr(lst, col)
+            if k in moved and current != v:
+                # Somebody else changed this exact field while the edit was queued.
+                # Keep the server value and hand both back, rather than picking a
+                # winner behind the artisan's back.
+                conflicts.append({"field": k, "mine": v, "theirs": current})
+                continue
+            setattr(lst, col, v)
+            changed.append(k)
         if body.status and db.can_transition(db.LISTING_FLOW, lst.status, body.status):
             db.log_event(s, "listing", lid, "status", lst.status, body.status, "manual")
             lst.status = body.status
         if changed:
             db.log_event(s, "listing", lid, "note", detail="edited: " + ", ".join(changed))
+        if conflicts:
+            db.log_event(s, "listing", lid, "conflict",
+                         detail="kept server value for: "
+                                + ", ".join(c["field"] for c in conflicts))
         s.commit()
-        return lst.public()
+        return {**lst.public(), "conflicts": conflicts}
     finally:
         s.close()
 
@@ -606,13 +738,28 @@ def listing_status(lid: str) -> dict[str, Any]:
 # ═══════════════════════════════════════════════════ 5. storefront + orders
 
 @app.get("/l/{lid}", response_class=HTMLResponse)
-def storefront_page(lid: str) -> str:
-    """The real, openable product page behind every storefront listing URL."""
+def storefront_page(lid: str, request: Request) -> str:
+    """
+    The real, openable product page behind every storefront listing URL.
+
+    Serving it is also the only place in the system where a view is counted, and it is
+    counted here because it genuinely happened: somebody requested this page. The
+    viewer is reduced to a salted hash bucketed by the hour, so a buyer reloading
+    while they decide counts once, and the row cannot be traced back to a person.
+    """
     s = db.session()
     try:
         lst = s.get(db.Listing, lid)
         if not lst:
             raise HTTPException(404, "listing not found")
+        try:
+            fwd = request.headers.get("x-forwarded-for", "")
+            ip = fwd.split(",")[0].strip() or (request.client.host if request.client else "")
+            analytics.record_view(s, lid, ip,
+                                  request.headers.get("user-agent", ""),
+                                  request.headers.get("referer", ""))
+        except Exception:
+            pass          # a counter must never stop a buyer seeing the product
         d = lst.public()
         e = html.escape
         title = e(d["titleEn"] or d["titleHi"] or "Handmade product")
@@ -658,6 +805,23 @@ def storefront_page(lid: str) -> str:
   <button {'disabled' if sold_out else ''}>Place order · ₹{d['price']:,.0f}</button>
 </form>
 <div id="done"></div>
+
+<form id="bulk">
+  <h3 style="margin:0 0 4px">Need a larger quantity?</h3>
+  <p style="margin:0 0 10px;color:#7C7596;font-size:14px">
+    Ordering many pieces, or want a custom variation? Send the maker your
+    requirement and they will reply with a price.</p>
+  <input name="buyerName" placeholder="Your name" required>
+  <input name="organisation" placeholder="Shop or organisation (optional)">
+  <input name="buyerPhone" placeholder="Phone number" required>
+  <input name="buyerEmail" type="email" placeholder="Email (optional)">
+  <input name="quantity" type="number" min="2" placeholder="How many pieces?" required>
+  <input name="neededBy" placeholder="Needed by (e.g. 15 March)">
+  <textarea name="message" rows="3"
+    placeholder="Anything specific - colours, sizes, packaging"></textarea>
+  <button style="background:#2E2A6B">Send enquiry</button>
+</form>
+<div id="bulkdone"></div>
 </div><script>
 document.getElementById('f').addEventListener('submit', async (ev) => {{
   ev.preventDefault();
@@ -675,6 +839,23 @@ document.getElementById('f').addEventListener('submit', async (ev) => {{
     '<br>Payment: ' + j.paymentStatus +
     (j.payLink ? '<br><br><a href="'+j.payLink+'">Pay ₹' + j.amount + ' via UPI</a>' : '') +
     '</div>';
+}});
+document.getElementById('bulk').addEventListener('submit', async (ev) => {{
+  ev.preventDefault();
+  const fd = Object.fromEntries(new FormData(ev.target).entries());
+  fd.listingId = {json.dumps(lid)};
+  fd.quantity = parseInt(fd.quantity || '0', 10);
+  const btn = ev.target.querySelector('button');
+  btn.disabled = true; btn.textContent = 'Sending…';
+  const r = await fetch('/v1/enquiries', {{method:'POST',
+    headers:{{'Content-Type':'application/json'}}, body: JSON.stringify(fd)}});
+  const j = await r.json();
+  if (!r.ok) {{ btn.disabled=false; btn.textContent='Try again';
+                alert(j.detail||'failed'); return; }}
+  ev.target.style.display='none';
+  document.getElementById('bulkdone').innerHTML =
+    '<div class="ok"><b>Enquiry ' + j.id + ' sent.</b><br>' +
+    'The maker will see it in their app and reply to you directly.</div>';
 }});
 </script></body></html>"""
     finally:
@@ -964,21 +1145,160 @@ def passport(body: PassportIn) -> dict[str, Any]:
             "publicKey": "ed25519:" + base64.b64encode(pub).decode()}
 
 
-TRENDS_SYSTEM = """You advise Indian craft clusters on what to produce next season.
-Give a production brief in plain language with a realistic rupee band.
-Return JSON: {"trends":[{title, detail, band, confidence}]} with exactly 3 entries."""
+# The /v1/trends endpoint was removed here.
+#
+# It asked Nemotron to produce "three trends with a realistic rupee band" for a craft
+# cluster and the app rendered them with a confidence percentage. A language model
+# guessing what handloom sells for is not market data, and an artisan who priced
+# against it would have been priced against nothing. /v1/insights replaces it with
+# aggregates computed from listings that were actually published on this network,
+# withheld entirely when too few sellers contribute to anonymise safely.
+
+# ═══════════════════════════════════════════ 7. enquiries, summary, insights
+
+class EnquiryIn(BaseModel):
+    listingId: str
+    buyerName: str
+    buyerPhone: str
+    buyerEmail: str = ""
+    organisation: str = ""
+    quantity: int = 0
+    targetPrice: float = 0
+    neededBy: str = ""
+    message: str = ""
 
 
-class TrendsIn(BaseModel):
-    cluster: str = "varanasi-handloom"
-
-
-@app.post("/v1/trends")
-def trends(body: TrendsIn) -> dict[str, Any]:
-    if not llm.available():
-        return {"trends": [], "source": "unavailable"}
+@app.post("/v1/enquiries")
+def create_enquiry(body: EnquiryIn) -> dict[str, Any]:
+    """
+    A buyer asking for a bigger or custom order, from the real form on the listing
+    page. This is what replaced the old consortium screen: that showed an invented
+    group of artisans filling an invented 500-piece order. An enquiry is a message
+    somebody actually sent, or there is no enquiry.
+    """
+    s = db.session()
     try:
-        out = llm.chat_json(TRENDS_SYSTEM, f"Craft cluster: {body.cluster}")
-        return {"trends": out.get("trends", [])[:3], "source": "nemotron"}
-    except Exception as e:
-        return {"trends": [], "source": f"error: {type(e).__name__}"}
+        lst = s.get(db.Listing, body.listingId)
+        if not lst:
+            raise HTTPException(404, "listing not found")
+        if body.quantity < 2:
+            raise HTTPException(400, "a bulk enquiry needs at least 2 pieces")
+        if not body.buyerName.strip() or not body.buyerPhone.strip():
+            raise HTTPException(400, "name and phone are required")
+        e = db.Enquiry(
+            id=db.nid("enq"), listing_id=lst.id, artisan_id=lst.artisan_id,
+            channel="storefront", buyer_name=body.buyerName.strip(),
+            buyer_phone=body.buyerPhone.strip(), buyer_email=body.buyerEmail.strip(),
+            organisation=body.organisation.strip(), quantity=body.quantity,
+            target_price=body.targetPrice, needed_by=body.neededBy.strip(),
+            message=body.message.strip())
+        s.add(e)
+        db.log_event(s, "enquiry", e.id, "created", "", "new",
+                     f"{body.quantity} pieces via storefront")
+        s.commit()
+        return e.public()
+    finally:
+        s.close()
+
+
+@app.get("/v1/enquiries")
+def list_enquiries(authorization: str | None = Header(None)) -> dict[str, Any]:
+    """Enquiries on the caller's own products. Nobody else's."""
+    s = db.session()
+    try:
+        me = auth.artisan_from_token(s, authorization)
+        if not me:
+            return {"enquiries": []}
+        rows = (s.query(db.Enquiry).filter(db.Enquiry.artisan_id == me.id)
+                .order_by(db.Enquiry.created_at.desc()).limit(200).all())
+        titles = {l.id: (l.title_hi or l.title_en or "")
+                  for l in s.query(db.Listing)
+                  .filter(db.Listing.artisan_id == me.id).all()}
+        return {"enquiries": [{**e.public(), "productTitle": titles.get(e.listing_id, "")}
+                              for e in rows]}
+    finally:
+        s.close()
+
+
+class EnquiryPatch(BaseModel):
+    status: str | None = None
+    reply: str | None = None
+
+
+@app.patch("/v1/enquiries/{eid}")
+def patch_enquiry(eid: str, body: EnquiryPatch,
+                  authorization: str | None = Header(None)) -> dict[str, Any]:
+    s = db.session()
+    try:
+        me = auth.artisan_from_token(s, authorization)
+        if not me:
+            raise HTTPException(401, "login required")
+        e = s.get(db.Enquiry, eid)
+        if not e or e.artisan_id != me.id:
+            raise HTTPException(404, "enquiry not found")
+        if body.reply is not None:
+            e.reply = body.reply
+            if e.status == "new":
+                e.status = "replied"
+        if body.status:
+            if (body.status not in db.ENQUIRY_FLOW
+                    and body.status not in db.ENQUIRY_TERMINAL):
+                raise HTTPException(400, f"unknown status {body.status}")
+            db.log_event(s, "enquiry", eid, "status", e.status, body.status, "seller")
+            e.status = body.status
+        s.commit()
+        return e.public()
+    finally:
+        s.close()
+
+
+@app.get("/v1/summary")
+def summary(authorization: str | None = Header(None),
+            x_guest_token: str | None = Header(None)) -> dict[str, Any]:
+    """
+    Home. Counts of the artisan's own rows, plus what needs doing.
+
+    A guest has no account, so there is nothing to total beyond the drafts on this
+    device; the app shows those and invites them to sign in rather than displaying an
+    empty dashboard.
+    """
+    s = db.session()
+    try:
+        me = auth.artisan_from_token(s, authorization)
+        if not me:
+            drafts = []
+            if x_guest_token:
+                drafts = (s.query(db.Listing)
+                          .filter(db.Listing.guest_token == x_guest_token,
+                                  db.Listing.artisan_id.is_(None))
+                          .order_by(db.Listing.updated_at.desc()).limit(20).all())
+            return {"authenticated": False,
+                    "drafts": [analytics.listing_card(s, d) for d in drafts]}
+        out = analytics.summary(s, me.id)
+        return {"authenticated": True, **out}
+    finally:
+        s.close()
+
+
+@app.get("/v1/insights")
+def insights(authorization: str | None = Header(None)) -> dict[str, Any]:
+    """
+    What other sellers on this network are doing, aggregated and anonymised.
+
+    Only published listings are counted, no seller is named, and a category is
+    dropped entirely unless several different artisans contribute to it - which is
+    what prevents an "average price" from being one person's price. When there is not
+    enough data the response says so; it does not manufacture a trend.
+    """
+    s = db.session()
+    try:
+        me = auth.artisan_from_token(s, authorization)
+        return analytics.insights(s, me.id if me else None)
+    finally:
+        s.close()
+
+
+@app.get("/v1/marketplaces/support")
+def marketplace_support() -> dict[str, Any]:
+    """Which figures each platform can ever give us, so a blank can be explained."""
+    return {"support": channels.metric_support(), "metrics": channels.METRICS}

@@ -157,9 +157,12 @@ Install on a connected phone (USB debugging on):
 adb install -r app/build/outputs/apk/release/app-release.apk
 ```
 
-**Set `EXPO_PUBLIC_API_URL` to your own LAN IP** — it is baked in at build time. If
-you forget, or your IP changes, you do not need to rebuild: open the app's
-**Profile → Server address**, type it, and press Test.
+**Set `EXPO_PUBLIC_API_URL` to your own LAN IP** — it is baked in at build time.
+
+There is no longer a "Server address" field in the app. It was developer configuration
+sitting in a screen used by people who have never seen a URL, so it was removed. If
+your IP changes, rebuild with the new value, or run a dev build (`npx expo start`),
+which infers the LAN address from Metro automatically.
 
 ---
 
@@ -181,7 +184,9 @@ you forget, or your IP changes, you do not need to rebuild: open the app's
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `MalformedURLException: no protocol` | No backend URL in the build | Set `EXPO_PUBLIC_API_URL`, or use Profile → Server address |
+| `MalformedURLException: no protocol` | No backend URL in the build | Set `EXPO_PUBLIC_API_URL` before `gradlew assembleRelease` |
+| Onboarding repeats after closing the app | An old build. Fixed by real storage — see `docs/ARCHITECTURE.md` §1 | Reinstall the current APK |
+| A marketplace figure shows `—` | That platform does not expose the metric | Tap it; the app states the reason. See `docs/ARCHITECTURE.md` §5 |
 | `CLEARTEXT communication not permitted` | Android blocks plain HTTP in release builds | Already fixed by `app/plugins/withLocalNetworkAccess.js`. If it returns, re-run `npx expo prebuild` |
 | Phone cannot reach the laptop | Different networks, or firewall | Same Wi-Fi; add the firewall rule above. Mobile data will not work |
 | `"llm": "not configured"` | `NVIDIA_API_KEY` missing or `.env` not loaded | Check `backend/.env`; restart uvicorn (it reads `.env` at startup) |
@@ -200,8 +205,15 @@ Never write a user-facing string inline. All 330 live in `app/src/i18n/catalog.t
 
 ```bash
 cd app && node scripts/dump-en.mjs        # catalogue -> locales/en.json + hi.json
-cd ../backend && python translate_ui.py   # -> gu bn mr ta te kn or (Nemotron, ~25 min each)
+cd ../backend && python translate_ui.py   # fills only the gaps (fast)
+python translate_ui.py --all gu           # or retranslate one language completely
+python check_scripts.py                   # report script mixing; --fix repairs it
 ```
+
+`translate_ui.py` is incremental: it translates keys that are missing, or whose value
+is still identical to the English source (which is what a silently failed batch looks
+like). `check_scripts.py` catches the model mixing scripts inside a word — `અकेલા` for
+`અકેલા` — which is easy to miss because the rest of the string is right.
 
 The generated JSON is committed so the app needs no network to render its own UI.
 Missing strings fall back to **English, never Hindi**, so a gap is visible.
@@ -222,6 +234,7 @@ backend/
   channels.py        storefront, ONDC, GeM, Amazon, Shopify adapters
   logistics.py       Shiprocket / Delhivery, tracking webhooks
   db.py              SQLAlchemy models
+  analytics.py       view counting, product cards, home summary, insights
   translate_ui.py    regenerates the UI translations
 
 app/
@@ -230,9 +243,15 @@ app/
   src/nav/Shell.tsx  top bar, tab bar
   src/screens/       Home, Products, Orders, Profile, Create, GuidedCamera, Auth
   src/vision/        on-device capture analysis (no models, no network)
+  src/lib/storage.ts AsyncStorage + Keystore
+  src/lib/session.ts persisted session, hydrated before first paint
+  src/lib/cache.ts   last known good copy of every list
+  src/lib/sync.ts    offline write queue, field-level conflicts
+  src/lib/store.tsx  the data layer every screen reads from
   plugins/           Expo config plugin for LAN cleartext
 
-docs/ON-DEVICE.md    what runs on the phone and why
+docs/ON-DEVICE.md       what runs on the phone and why
+docs/ARCHITECTURE.md    storage, offline sync, and which figures are real
 ```
 
 ---

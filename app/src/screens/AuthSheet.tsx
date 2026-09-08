@@ -128,10 +128,20 @@ export default function AuthSheet({
       const r = await api.verifyOtp(challengeId, code, session.guestToken());
       session.setToken(r.token);
       setArtisan(r.artisan);
-      // A returning artisan keeps the language stored on their account; a new one
-      // takes the language they just chose on this device.
-      if (r.isNewAccount) api.updateProfile({ language: lang }).catch(() => {});
-      else if (r.artisan.language) setLang(r.artisan.language as any);
+      // The language chosen on this device wins, and is pushed up to the account so
+      // it follows the artisan to another phone. Taking the account's language
+      // instead - which this used to do - meant signing in silently changed the
+      // interface out from under somebody who had just picked Gujarati, because the
+      // account still held the default. The account's language is only adopted when
+      // the device has no choice of its own recorded.
+      const chosen = session.getLang();
+      if (chosen) {
+        if (r.artisan.language !== chosen) {
+          api.updateProfile({ language: chosen }).catch(() => { /* queued elsewhere */ });
+        }
+      } else if (r.artisan.language) {
+        setLang(r.artisan.language as any);
+      }
       const rd = await api.readiness();
       setReadiness(rd.readiness);
       setFullName(r.artisan.fullName);

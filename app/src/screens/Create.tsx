@@ -25,14 +25,23 @@ import * as connection from '../lib/connection';
 import { AiButton, Spark } from '../ui/AiButton';
 import ModeSheet from './ModeSheet';
 import { listen, isSupported, LANGS, Listener } from '../lib/speech';
+import * as drafts from '../lib/drafts';
+import * as cache from '../lib/cache';
 
 /**
  * The whole listing flow on ONE page.
  *
- * Sections appear below one another as they are completed and are never unmounted,
- * so scrolling back always shows exactly what was entered. All state lives in this
- * component and is mirrored to the backend on edit, so progress survives a reload
- * too - the draft row is the source of truth, not component state.
+ * Every section is rendered from the moment there is a photograph, and the timeline
+ * at the top is tappable, so going back to change something already done is one tap
+ * and never loses anything. Nothing here locks.
+ *
+ * The listing is created on the phone, not on the server. `draftId` is a local id
+ * that exists the instant a photograph is taken, with no network involved; the
+ * photograph itself is copied into the app's own storage. `listingId` is the
+ * backend's id and stays null until a backend has actually accepted it. Nothing in
+ * this screen waits on that. The previous version could only make a listing by
+ * uploading it first, which meant that on a phone with no signal - the phone this
+ * app exists for - taking a photograph produced a red error and no way forward.
  *
  * Every AI-produced value lands in an editable Field and stays editable until the
  * artisan presses Publish. Nothing locks.
@@ -81,6 +90,9 @@ export default function Create({
 }: { onHome: () => void; resumeId?: string | null }) {
   // ── form state (the single source of truth while editing) ────────────────
   const [rawUri, setRawUri] = useState<string | null>(null);
+  /** The draft on this phone. Exists from the first photograph, offline or not. */
+  const [draftId, setDraftId] = useState<string | null>(null);
+  /** The backend's id, once a backend has seen it. Null is a normal state. */
   const [listingId, setListingId] = useState<string | null>(null);
   const [analysis, setAnalysis] = useState<api.AnalyzeOut | null>(null);
   const [busy, setBusy] = useState<string>('');
@@ -117,6 +129,8 @@ export default function Create({
   const store = useStore();
   /** The row version the current edits were made against. */
   const baseVersion = useRef<string | null>(null);
+  /** The server id, readable straight after it is set. State would be a frame late. */
+  const listingIdRef = useRef<string | null>(null);
 
   /**
    * How this listing gets made.
@@ -158,8 +172,47 @@ export default function Create({
   const [blocked, setBlocked] = useState<Record<string, string[]>>({});
 
   const scroller = useRef<ScrollView>(null);
+  /** Where each numbered section starts, so a tap on the timeline can go there. */
+  const sectionY = useRef<Record<number, number>>({});
 
-  useEffect(() => { api.channels().then((r) => setChans(r.channels)).catch(() => {}); }, []);
+  useEffect(() => { if (draftId) drafts.patch(draftId, { craft, mode }); },
+            [craft, mode, draftId]);
+
+  /**
+   * Go to a step.
+   *
+   * The timeline used to be decoration: four coloured bars that told her where she
+   * was and gave her no way to get back to anything. Once a step was done it was
+   * gone. Now every step is a target, everything below stays on screen and editable,
+   * and nothing is recalculated or discarded by moving between them.
+   */
+  const goToStep = useCallback((i: number) => {
+    const y = sectionY.current[i];
+    scroller.current?.scrollTo({ y: Math.max(0, (y ?? 0) - 8), animated: true });
+  }, []);
+
+  const markSection = (i: number) => (e: any) => {
+    sectionY.current[i] = e.nativeEvent.layout.y;
+  };
+
+  // Where she can sell is a fact about the deployment, not about this minute's
+  // connection, so the last real answer is kept and shown when there is no signal.
+  // Without this the whole "where to sell" step vanished the moment the phone lost
+  // the network, taking the artisan's channel choices with it.
+  useEffect(() => {
+    let alive = true;
+    cache.read<api.Channel[]>(cache.K.channels).then((c) => {
+      if (alive && c?.data?.length) setChans((cur) => (cur.length ? cur : c.data));
+    });
+    api.channels()
+      .then((r) => {
+        if (!alive) return;
+        setChans(r.channels);
+        cache.write(cache.K.channels, r.channels);
+      })
+      .catch(() => { /* the cached list is already on screen */ });
+    return () => { alive = false; };
+  }, []);
 
   useEffect(() => {
     api.bootstrap()
@@ -171,7 +224,43 @@ export default function Create({
   // images, generated copy, price, chosen channels - comes back from the row.
   useEffect(() => {
     const id = resumeId || session.getDraft();
-    if (!id || listingId) return;
+    if (!id || listingId || draftId) return;
+
+    // A local draft restores entirely from this phone - no request, no waiting, and
+    // it works with the radio off. This is the ordinary path.
+    if (drafts.isLocalId(id)) {
+      drafts.get(id).then((d) => {
+        if (!d) { session.setDraft(null); return; }
+        setDraftId(d.id);
+        setRawUri(d.imageUri);
+        if (d.craft) { setCraft(d.craft as CategoryKey); planRef.current = new ShotPlan(d.craft as CategoryKey); }
+        if (d.shots?.length) {
+          for (const sh of d.shots) planRef.current.add(sh.uri, sh.key);
+          setShots([...planRef.current.captured]);
+        }
+        const f = d.fields || {};
+        setTitleEn(f.titleEn ?? ''); setTitleHi(f.titleHi ?? '');
+        setDescEn(f.descEn ?? ''); setDescHi(f.descHi ?? '');
+        setCategory(f.category ?? ''); setHsn(f.hsn ?? '');
+        if (f.price) setPriceStr(String(f.price));
+        if (f.quantity) setQtyStr(String(f.quantity));
+        if (f.transcript) setTranscript(String(f.transcript));
+        if (Array.isArray(f.channelsSelected) && f.channelsSelected.length) {
+          setPicked(f.channelsSelected);
+        }
+        if (Array.isArray(f.priceBreakdown) && f.priceBreakdown.length) {
+          setBreakdown(f.priceBreakdown.map((b: any, i: number) => ({
+            id: `bd_local_${i}`, label: String(b.label ?? ''),
+            amount: String(b.amount ?? ''),
+          })));
+          setBreakdownDirty(true);
+        }
+        if (f.priceRationale) { setRationale(String(f.priceRationale)); setRationaleDirty(true); }
+        if (d.serverId) { listingIdRef.current = d.serverId; setListingId(d.serverId); }
+      });
+      return;
+    }
+
     api.getListing(id).then((l) => {
       setListingId(l.id);
       setTitleEn(l.titleEn); setTitleHi(l.titleHi);
@@ -206,10 +295,17 @@ export default function Create({
       // Remember which version these edits are being made against, so an edit that
       // sits in the offline queue can be merged rather than blindly replayed.
       baseVersion.current = l.updatedAt ?? null;
-    }).catch(() => session.setDraft(null));
+      listingIdRef.current = l.id;
+      // Give the server row a home on this phone too, so the next time she opens it
+      // there is something to show before any request has finished.
+      drafts.create({ serverId: l.id, imageUri: l.imageUrl || null,
+                      syncState: 'synced' }).then((d) => setDraftId(d.id));
+    }).catch(() => { /* keep the id: it may just be a bad moment for the network */ });
   }, [resumeId]);
 
-  useEffect(() => { if (listingId) session.setDraft(listingId); }, [listingId]);
+  // What "resume this" points at is the local draft, because that is the copy that
+  // is always there. The server id travels inside it.
+  useEffect(() => { if (draftId) session.setDraft(draftId); }, [draftId]);
 
   // Mirror edits so a refresh never loses work. Debounced, because typing must not
   // fire a request per keystroke.
@@ -227,6 +323,28 @@ export default function Create({
       store.editListing(listingId, patch as Record<string, any>, baseVersion.current);
     }, 700);
   }, [listingId, store]);
+
+  // Everything typed is written to the local draft on a short debounce. This is the
+  // save that always succeeds; the server mirror below is the one that may have to
+  // wait for a signal.
+  const localTimer = useRef<any>(null);
+  useEffect(() => {
+    if (!draftId) return;
+    clearTimeout(localTimer.current);
+    localTimer.current = setTimeout(() => {
+      drafts.patchFields(draftId, {
+        titleEn, titleHi, descEn, descHi, category, hsn, transcript,
+        price: parseFloat(priceStr) || 0,
+        quantity: parseInt(qtyStr, 10) || 1,
+        channelsSelected: picked,
+        priceBreakdown: breakdown.map((b) => ({
+          label: b.label, amount: parseFloat(b.amount) || 0 })),
+        priceRationale: rationale,
+      });
+    }, 400);
+    return () => clearTimeout(localTimer.current);
+  }, [titleEn, titleHi, descEn, descHi, category, hsn, priceStr, qtyStr, picked,
+      breakdown, rationale, transcript, draftId]);
 
   useEffect(() => {
     if (!listingId) return;
@@ -253,10 +371,7 @@ export default function Create({
     if (mode === 'camera') { setCamOpen(true); return; }
     try {
       const r = await ImagePicker.launchImageLibraryAsync({ quality: 0.9 });
-      if (!r.canceled && r.assets?.[0]) {
-        setRawUri(r.assets[0].uri);
-        handlePhoto(r.assets[0].uri);
-      }
+      if (!r.canceled && r.assets?.[0]) await handlePhoto(r.assets[0].uri);
     } catch (e: any) {
       setErr(String(e?.message || e));
     }
@@ -266,16 +381,29 @@ export default function Create({
     planRef.current.add(uri, key);
     setShots([...planRef.current.captured]);
     const first = planRef.current.captured.length === 1;
-    if (first) {
-      setRawUri(uri);
-      setCamOpen(false);
-      handlePhoto(uri);
-      // Say why another photo helps, without forcing one.
-      setShotHint(planRef.current.nextShotKey());
-    } else {
-      setCamOpen(false);
-      setShotHint(planRef.current.nextShotKey());
-    }
+    setCamOpen(false);
+    // Say why another photo helps, without forcing one.
+    setShotHint(planRef.current.nextShotKey());
+    if (first) void handlePhoto(uri);
+    else if (draftId) void drafts.patch(draftId, { shots: planRef.current.captured });
+  }
+
+  /**
+   * A network failure is not the artisan's problem and must not look like one.
+   *
+   * Anything that is plainly the connection - no backend configured, a refused
+   * socket, a timeout - becomes a calm line saying the work is safe on the phone.
+   * Everything else is a real error and is shown as one. The old code printed
+   * `fetch failed: java.net.ConnectException` in a red box, which tells an artisan
+   * nothing and tells her, wrongly, that she has lost her work.
+   */
+  function reportSoft(e: any) {
+    const msg = String(e?.message || e);
+    const networkish = e instanceof api.OfflineError
+      || /network request failed|fetch failed|connectexception|failed to connect|unable to resolve host|timed out|timeout|aborted|enotfound|econnrefused|backend not reachable/i
+           .test(msg);
+    if (networkish) { setErr(''); setNotice(t('create.savedOnPhone')); }
+    else setErr(msg);
   }
 
   /**
@@ -290,12 +418,39 @@ export default function Create({
    * the draft so the AI buttons have something to look at, and she writes the listing.
    */
   async function handlePhoto(uri: string) {
-    if (!session.getMode()) { pendingPhoto.current = uri; setModeAsk(true); return; }
-    if (mode === 'manual') { await attachOnly(uri); return; }
+    setErr('');
+    // Step one, always, before anything touches the network: the photograph is
+    // copied somewhere permanent and a draft exists on this phone. From here on
+    // every section of this screen has something to work with, whatever the
+    // connection does.
+    const kept = await drafts.keepPhoto(uri);
+    setRawUri(kept);
+    const id = await ensureDraft(kept);
+
+    if (!session.getMode()) { pendingPhoto.current = kept; setModeAsk(true); return; }
+    if (mode === 'manual') { void attachOnly(kept); return; }
 
     const reading = await connection.measure();
-    if (connection.useBackgroundJob(reading)) { await sendAsJob(uri); return; }
-    await runAnalyze(uri);
+    if (connection.useBackgroundJob(reading)) { void sendAsJob(kept); return; }
+    void runAnalyze(kept);
+    return id;
+  }
+
+  /** Create the local draft if there isn't one, and keep it current. */
+  async function ensureDraft(imageUri?: string | null): Promise<string> {
+    if (draftId) {
+      await drafts.patch(draftId, {
+        craft, mode, ...(imageUri ? { imageUri } : {}),
+        shots: planRef.current.captured,
+      });
+      return draftId;
+    }
+    const d = await drafts.create({
+      craft, mode, imageUri: imageUri ?? null, shots: planRef.current.captured,
+    });
+    setDraftId(d.id);
+    session.setDraft(d.id);
+    return d.id;
   }
 
   /**
@@ -313,12 +468,22 @@ export default function Create({
         skipModels: true,
       } as any);
       setAnalysis(out);
-      setListingId(out.listingId);
+      await adoptServerId(out.listingId);
     } catch (e: any) {
-      setErr(String(e?.message || e));
+      // The draft is already on the phone. Failing to mirror it is a delay, not a
+      // loss, and she carries on writing either way.
+      reportSoft(e);
     } finally {
       setBusy('');
     }
+  }
+
+  /** Remember the backend's id on the local draft, so the two are tied together. */
+  async function adoptServerId(id: string) {
+    listingIdRef.current = id;
+    setListingId(id);
+    const local = draftId ?? (await ensureDraft(rawUri));
+    await drafts.patch(local, { serverId: id, syncState: 'synced' });
   }
 
   /** Auto mode on a slow connection: upload once, walk away. */
@@ -337,7 +502,7 @@ export default function Create({
       setTimeout(() => onHome(), 1800);
       return job;
     } catch (e: any) {
-      setErr(String(e?.message || e));
+      reportSoft(e);
     } finally {
       setBusy('');
     }
@@ -351,7 +516,7 @@ export default function Create({
         transcript, lang, background: 'studio', listingId: listingId ?? undefined,
       });
       setAnalysis(out);
-      setListingId(out.listingId);
+      await adoptServerId(out.listingId);
       const d = out.detected || {};
       // Fill only empty fields - never overwrite something already edited.
       setTitleEn((v) => v || String(d.title ?? ''));
@@ -362,7 +527,7 @@ export default function Create({
       api.mintPassport({ rawHash: out.rawHash, ops: out.ops, artisanId: 'ART-UP-VNS-4471' })
         .then(setPassport).catch(() => {});
     } catch (e: any) {
-      setErr(String(e?.message || e));
+      reportSoft(e);
     } finally {
       setBusy('');
     }
@@ -376,11 +541,18 @@ export default function Create({
    * suggestions stay consistent with it rather than contradicting her.
    */
   async function continueWithAi() {
-    if (!listingId) { setErr(t('ai.needsPhotoFirst')); return; }
     setAiBusy('continue');
     setErr('');
     try {
-      const r = await api.assistContinue({ listingId, from_step: 'catalog' });
+      // There may be a draft that no backend has seen yet - that is the normal state
+      // offline. Hand it over first; if that cannot happen, say so plainly.
+      if (!listingIdRef.current && rawUri) await attachOnly(rawUri);
+      const id = listingIdRef.current;
+      if (!id) {
+        setNotice(rawUri ? t('create.aiNeedsNet') : t('ai.needsPhotoFirst'));
+        return;
+      }
+      const r = await api.assistContinue({ listingId: id, from_step: 'catalog' });
       const cat = r.suggestions?.catalog || {};
       setTitleEn((v) => v || String(cat.titleEn ?? ''));
       setTitleHi((v) => v || String(cat.titleHi ?? ''));
@@ -400,7 +572,8 @@ export default function Create({
       }
       setNotice(t('ai.continueDone'));
     } catch (e: any) {
-      setErr(e?.status === 503 ? t('ai.notConfigured') : String(e?.message || e));
+      if (e?.status === 503) setErr(t('ai.notConfigured'));
+      else reportSoft(e);
     } finally {
       setAiBusy('');
     }
@@ -440,7 +613,7 @@ export default function Create({
       setCategory(out.category ?? category);
       setHsn(out.hsn ?? hsn);
     } catch (e: any) {
-      setErr(String(e?.message || e));
+      reportSoft(e);
     } finally { setBusy(''); }
   }
 
@@ -507,29 +680,47 @@ export default function Create({
       }
       if (!rationaleDirty) setRationale(a.rationale || '');
     } catch (e: any) {
-      setErr(String(e?.message || e));
+      reportSoft(e);
     } finally { setBusy(''); }
   }
 
   /* ── step 5: publish ─────────────────────────────────────────────────── */
 
   async function doPublish() {
-    if (!listingId) return;
+    // Publishing genuinely needs the server: a listing has to exist somewhere a
+    // buyer can reach. What must not happen is the button doing nothing at all,
+    // which is what `if (!listingId) return` did on every offline tap. Try to hand
+    // the draft over first, and if that cannot happen, say why and keep the work.
+    if (!listingId) {
+      setBusy(t('create.publishing'));
+      try {
+        if (rawUri) await attachOnly(rawUri);
+      } finally { setBusy(''); }
+      if (!listingIdRef.current) {
+        if (draftId) await drafts.patchFields(draftId, { pendingPublish: picked });
+        setErr('');
+        setNotice(t('create.publishNeedsNet'));
+        return;
+      }
+    }
     setBusy(t('create.publishing'));
     setErr('');
     setBlocked({});
+    const id = listingIdRef.current || listingId!;
     try {
-      await api.updateListing(listingId, {
+      await api.updateListing(id, {
         titleEn, titleHi, descEn, descHi, category, hsn,
         price: parseFloat(priceStr) || 0, quantity: parseInt(qtyStr, 10) || 1,
         channelsSelected: picked,
       } as any);
-      const out = await api.publishListing(listingId, picked);
+      const out = await api.publishListing(id, picked);
       setPubs(out.publications);
       setLive(out.listing);
-      const st = await api.listingStatus(listingId);
+      const st = await api.listingStatus(id);
       setOrders(st.orders);
+      if (draftId) await drafts.patch(draftId, { syncState: 'synced' });
       session.setDraft(null);
+      setTimeout(() => goToStep(5), 300);
     } catch (e: any) {
       // These two are not failures so much as "one more step". The listing stays
       // exactly as it is underneath the sheet.
@@ -541,7 +732,8 @@ export default function Create({
         setAuthReason(t('auth.needMore'));
         setAuthOpen(true);
       } else {
-        setErr(String(e?.message || e));
+        reportSoft(e);
+        if (draftId) await drafts.patchFields(draftId, { pendingPublish: picked });
       }
     } finally { setBusy(''); }
   }
@@ -572,8 +764,14 @@ export default function Create({
     isLive ? 6 : hasPrice && picked.length ? 5 : hasPrice ? 4 : hasInfo ? 3 :
     hasDetect ? 2 : hasPhoto ? 1 : 0;
 
-  const st = (i: number): 'done' | 'active' | 'locked' =>
-    step > i ? 'done' : step === i ? 'active' : 'locked';
+  /**
+   * A section is either finished or open. Never locked.
+   *
+   * `Section` hides its children when locked, which is how the create screen used to
+   * end in a dead end: with no analysis there was no step 2, so there was no step 3,
+   * and the artisan was left looking at her photograph with nothing to press.
+   */
+  const st = (i: number): 'done' | 'active' | 'locked' => (step > i ? 'done' : 'active');
 
   const conf = analysis?.confidence || {};
 
@@ -617,7 +815,10 @@ export default function Create({
             const done = step > i;
             const active = step === i;
             return (
-              <View key={stepKey} style={{ flex: 1, gap: 5 }}>
+              <Pressable key={stepKey} onPress={() => goToStep(i)} hitSlop={8}
+                         accessibilityRole="button"
+                         accessibilityLabel={t(stepKey)}
+                         style={{ flex: 1, gap: 5, paddingVertical: 4 }}>
                 <View style={{
                   height: 4, borderRadius: 99,
                   backgroundColor: done ? C.money
@@ -627,10 +828,13 @@ export default function Create({
                   fontSize: 11,
                   color: done || active ? C.ink : C.inkSoft,
                 }]} numberOfLines={1}>{t(stepKey)}</Text>
-              </View>
+              </Pressable>
             );
           })}
         </View>
+        <Text style={[T.micro, { fontSize: 11, marginTop: 4, color: C.inkSoft }]}>
+          {t('create.tapStepToGoBack')}
+        </Text>
       </View>
 
       <ScrollView ref={scroller}
@@ -672,10 +876,14 @@ export default function Create({
         </Pressable>
 
         {/* ── 1. photo ─────────────────────────────────────────────────── */}
-        <Section n={1} title={t('create.step.photo')} subtitle={t('create.photoSub')} state={st(0) === 'locked' ? 'active' : st(0)}>
+        <View onLayout={markSection(0)}>
+        <Section n={1} title={t('create.step.photo')} subtitle={t('create.photoSub')} state={st(0)}>
           <Card style={{ padding: S.sm }}>
-            {analysis?.imageUrl || rawUri ? (
-              <Image source={{ uri: analysis?.imageUrl || rawUri! }}
+            {rawUri || analysis?.imageUrl ? (
+              // The file on this phone comes first. The server's copy is a URL on a
+              // machine that may not be reachable, and when it was preferred the
+              // photograph she had just taken showed as an empty grey square.
+              <Image source={{ uri: rawUri || analysis!.imageUrl }}
                      style={{ width: '100%', aspectRatio: 1, borderRadius: R.lg,
                               backgroundColor: C.bgAlt }} resizeMode="contain" />
             ) : (
@@ -752,7 +960,16 @@ export default function Create({
                  icon={<Sparkle color={C.ink} size={20} />}
                  onPress={() => runAnalyze(rawUri)} />
           ) : null}
+
+          {/* The photograph is taken and there is somewhere to go. This button was
+              simply missing before: in manual mode nothing followed the shutter. */}
+          {hasPhoto ? (
+            <Btn label={t('common.continue')} tone="money"
+                 icon={<Arrow color={C.white} size={20} />}
+                 onPress={() => goToStep(1)} />
+          ) : null}
         </Section>
+        </View>
 
         {busy ? (
           <Card tone="soft">
@@ -762,11 +979,36 @@ export default function Create({
         ) : null}
 
         {/* ── 2. detection + OCR ───────────────────────────────────────── */}
-        {analysis ? (
+        {hasPhoto ? (
+          <View onLayout={markSection(1)}>
           <Section n={2} title={t('create.detectTitle')}
-                   subtitle={t('create.detectSub', { n: analysis.ocr?.boxes?.length ?? 0, ms: analysis.ms })}
+                   subtitle={analysis
+                     ? t('create.detectSub', { n: analysis.ocr?.boxes?.length ?? 0, ms: analysis.ms })
+                     : mode === 'manual' ? t('create.detectSkipped')
+                                         : t('create.detectOffline')}
                    state={st(1)}>
-            {analysis.ocr?.boxes?.length ? (
+            {!analysis ? (
+              // No analysis is a legitimate state, not a failure. In manual mode it
+              // is the promise being kept - nothing has looked at her photograph. In
+              // auto mode with no signal it is simply not done yet. Either way the
+              // step is complete enough to move past.
+              <Card tone="soft">
+                <Text style={T.bodySoft}>
+                  {mode === 'manual' ? t('create.detectSkipped') : t('create.detectOffline')}
+                </Text>
+                <View style={{ flexDirection: 'row', gap: S.sm }}>
+                  {rawUri ? (
+                    <Btn label={t('create.detectRetry')} tone="tonal" style={{ flex: 1 }}
+                         icon={<Sparkle color={C.primaryDeep} size={18} />}
+                         busy={!!busy} onPress={() => runAnalyze(rawUri)} />
+                  ) : null}
+                  <Btn label={t('common.continue')} tone="money" style={{ flex: 1 }}
+                       icon={<Arrow color={C.white} size={18} />}
+                       onPress={() => goToStep(2)} />
+                </View>
+              </Card>
+            ) : null}
+            {analysis?.ocr?.boxes?.length ? (
               <Card>
                 <Text style={T.label}>{t('create.ocrRead')}</Text>
                 {analysis.ocr.boxes.slice(0, 8).map((b, i) => (
@@ -778,12 +1020,13 @@ export default function Create({
                   </View>
                 ))}
               </Card>
-            ) : (
+            ) : analysis ? (
               <Card tone="warn">
                 <Text style={T.bodySoft}>{t('create.ocrNone')}</Text>
               </Card>
-            )}
+            ) : null}
 
+            {analysis ? (
             <Card>
               <Text style={T.label}>{t('create.aiFound')}</Text>
               {Object.entries(analysis.detected || {}).map(([k, v]) => (
@@ -806,16 +1049,18 @@ export default function Create({
                 </>
               ) : null}
             </Card>
+            ) : null}
 
-            {Object.keys(analysis.suggestions || {}).length ? (
+            {analysis && Object.keys(analysis.suggestions || {}).length ? (
               <Card tone="warn">
                 <Text style={T.label}>{t('create.lowConfidence')}</Text>
-                {Object.entries(analysis.suggestions).map(([k, v]) => (
+                {Object.entries(analysis!.suggestions).map(([k, v]) => (
                   <Text key={k} style={T.bodySoft}>{k}: {String(v)}</Text>
                 ))}
               </Card>
             ) : null}
 
+            {analysis ? (
             <Card>
               <Text style={T.label}>{t('create.whatHappened')}</Text>
               {analysis.ops.map((o, i) => (
@@ -825,11 +1070,20 @@ export default function Create({
                 </View>
               ))}
             </Card>
+            ) : null}
+
+            {analysis ? (
+              <Btn label={t('common.continue')} tone="money"
+                   icon={<Arrow color={C.white} size={20} />}
+                   onPress={() => goToStep(2)} />
+            ) : null}
           </Section>
+          </View>
         ) : null}
 
         {/* ── 3. editable details ──────────────────────────────────────── */}
-        {analysis ? (
+        {hasPhoto ? (
+          <View onLayout={markSection(2)}>
           <Section n={3} title={t('create.step.info')} subtitle={t('create.infoSub')} state={st(2)}>
             {/*
               In manual mode nothing has been analysed, so the one-tap escape hatch is
@@ -925,11 +1179,17 @@ export default function Create({
                      confidence={conf.hsn} placeholder={t('create.hsnHint')} />
               <Field label={t('create.quantity')} value={qtyStr} onChange={setQtyStr} numeric />
             </Card>
+
+            <Btn label={t('common.continue')} tone="money"
+                 icon={<Arrow color={C.white} size={20} />}
+                 onPress={() => goToStep(3)} />
           </Section>
+          </View>
         ) : null}
 
         {/* ── 4. price ─────────────────────────────────────────────────── */}
-        {hasInfo ? (
+        {hasPhoto ? (
+          <View onLayout={markSection(3)}>
           <Section n={4} title={t('create.step.price')} subtitle={t('create.priceSub')} state={st(3)}>
             <Card>
               <Field label={t('create.materialCost')} value={materialStr}
@@ -1038,12 +1298,24 @@ export default function Create({
                      onChange={(v) => { setRationale(v); setRationaleDirty(true); }}
                      placeholder={t('create.explainPlaceholder')} />
             </Card>
+
+            <Btn label={t('common.continue')} tone="money"
+                 icon={<Arrow color={C.white} size={20} />}
+                 onPress={() => goToStep(4)} />
           </Section>
+          </View>
         ) : null}
 
         {/* ── 5. channels + preview ────────────────────────────────────── */}
-        {hasPrice ? (
-          <Section n={5} title="कहाँ बेचना है" subtitle={t('create.channelsSub')} state={st(4)}>
+        {hasPhoto ? (
+          <View onLayout={markSection(4)}>
+          <Section n={5} title={t('create.step.channels')} subtitle={t('create.channelsSub')}
+                   state={st(4)}>
+            {!chans.length ? (
+              <Card tone="soft">
+                <Text style={T.bodySoft}>{t('create.channelsOffline')}</Text>
+              </Card>
+            ) : null}
             {chans.map((c) => {
               const on = picked.includes(c.id);
               return (
@@ -1082,8 +1354,8 @@ export default function Create({
             <Card>
               <Text style={T.label}>{t('create.review')}</Text>
               <View style={{ flexDirection: 'row', gap: S.md }}>
-                {analysis?.imageUrl ? (
-                  <Image source={{ uri: analysis.imageUrl }}
+                {rawUri || analysis?.imageUrl ? (
+                  <Image source={{ uri: rawUri || analysis!.imageUrl }}
                          style={{ width: 92, height: 92, borderRadius: R.md,
                                   backgroundColor: C.bgAlt }} />
                 ) : null}
@@ -1121,15 +1393,21 @@ export default function Create({
               </Card>
             ) : null}
 
-            <Btn label={`${picked.length} जगह भेजिए`} tone="money" large
+            <Btn label={t('create.sendTo', { n: picked.length })} tone="money" large
                  icon={<Arrow color={C.white} size={22} />}
-                 busy={busy === t('create.publishing')} disabled={!picked.length}
+                 busy={busy === t('create.publishing')}
+                 disabled={!picked.length || !hasPrice}
                  onPress={doPublish} />
+            {!hasPrice ? (
+              <Text style={[T.micro, { fontSize: 12 }]}>{t('create.priceFirst')}</Text>
+            ) : null}
           </Section>
+          </View>
         ) : null}
 
         {/* ── 6. live status ───────────────────────────────────────────── */}
         {pubs.length ? (
+          <View onLayout={markSection(5)}>
           <Section n={6} title={t('create.whereItWent')} subtitle={t('create.realStatus')} state="active">
             {pubs.map((p) => (
               <Card key={p.id}
@@ -1238,6 +1516,7 @@ export default function Create({
             <Btn label={t('nav.home')} tone="ghost" icon={<HomeIcon color={C.ink} size={20} />}
                  onPress={onHome} />
           </Section>
+          </View>
         ) : null}
       </ScrollView>
 

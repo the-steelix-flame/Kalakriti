@@ -625,6 +625,19 @@ export const EN = {
   'ai.accept': 'Use it',
   'ai.acceptAll': 'Use all of these',
   'ai.editable': 'You can change anything afterwards',
+
+  // ── working without a connection ───────────────────────────────────────
+  'create.savedOnPhone': 'Saved on your phone. It goes online by itself when there is a connection.',
+  'create.aiNeedsNet': 'The AI needs a connection. Fill this in yourself for now and ask the AI later - nothing is lost.',
+  'create.detectSkipped': 'You chose to fill this in yourself, so nothing was sent for analysis. Your photograph has not been looked at.',
+  'create.detectOffline': 'No connection, so the AI has not seen this photograph yet. It will look at it on its own when you are back online.',
+  'create.detectRetry': 'Try the AI again',
+  'create.channelsOffline': 'Where you can sell will show up when there is a connection. Everything you have written is already saved.',
+  'create.publishNeedsNet': 'Sending needs a connection. Your listing is finished and saved - it will go out as soon as you are online.',
+  'create.tapStepToGoBack': 'Tap any step above to go back and change it',
+  'create.sendTo': 'Send it to {n} place(s)',
+  'create.priceFirst': 'Put a price in first, then this can be sent.',
+  'sync.offlineOk': 'No internet - the app still works, everything is saved here',
 } as const;
 
 export type StringKey = keyof typeof EN;
@@ -1214,4 +1227,16 @@ export const HI: Record<StringKey, string> = {
   'ai.accept': 'ले लीजिए',
   'ai.acceptAll': 'ये सब ले लीजिए',
   'ai.editable': 'बाद में आप कुछ भी बदल सकती हैं',
+
+  'create.savedOnPhone': 'आपके फ़ोन में सहेज लिया। नेट आते ही अपने आप ऑनलाइन चला जाएगा।',
+  'create.aiNeedsNet': 'AI के लिए नेट चाहिए। अभी आप खुद भर लीजिए, बाद में AI से पूछ लीजिएगा — कुछ खोएगा नहीं।',
+  'create.detectSkipped': 'आपने खुद भरना चुना, इसलिए कुछ भी जाँच के लिए नहीं भेजा गया। आपकी फोटो को किसी ने देखा नहीं है।',
+  'create.detectOffline': 'नेट नहीं है, इसलिए AI ने यह फोटो अभी देखी नहीं। नेट आते ही यह अपने आप देख लेगा।',
+  'create.detectRetry': 'AI से फिर कोशिश कीजिए',
+  'create.channelsOffline': 'कहाँ बेचना है, यह नेट आने पर दिखेगा। आपने जो लिखा है वह सब सहेजा जा चुका है।',
+  'create.publishNeedsNet': 'भेजने के लिए नेट चाहिए। आपकी लिस्टिंग पूरी और सहेजी हुई है — नेट आते ही चली जाएगी।',
+  'create.tapStepToGoBack': 'ऊपर किसी भी कदम पर टैप करके वापस जाइए और बदल लीजिए',
+  'create.sendTo': '{n} जगह भेजिए',
+  'create.priceFirst': 'पहले कीमत लिख दीजिए, फिर यह भेजी जा सकेगी।',
+  'sync.offlineOk': 'नेट नहीं है — ऐप चलता रहेगा, सब यहीं सहेजा जा रहा है',
 };

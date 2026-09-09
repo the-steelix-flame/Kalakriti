@@ -78,6 +78,7 @@ export default function GuidedCameraNative({
             quality: 0.4,
             skipProcessing: true,   // no orientation/exif work: we only need pixels
             shutterSound: false,
+            animateShutter: false,  // no white flash: this frame is for us, not her
             imageType: 'jpg',
           } as any) as any;
           // Resize natively first: decoding a full-size JPEG in JS costs hundreds of
@@ -102,7 +103,7 @@ export default function GuidedCameraNative({
           busyRef.current = false;
         }
       }
-      if (aliveRef.current) loopRef.current = setTimeout(loop, 550);
+      if (aliveRef.current) loopRef.current = setTimeout(loop, 900);
     };
     loop();
     return () => { if (loopRef.current) clearTimeout(loopRef.current); };
@@ -111,8 +112,13 @@ export default function GuidedCameraNative({
   async function capture() {
     if (!camRef.current) return;
     setAnalysing(true);
+    // Hold the guidance loop off: a sampling capture landing in the middle of the
+    // real one is what made the preview jump at the worst possible moment.
+    busyRef.current = true;
     try {
-      const pic = await camRef.current.takePictureAsync({ quality: 0.92 }) as any;
+      const pic = await camRef.current.takePictureAsync({
+        quality: 0.92, animateShutter: false,
+      } as any) as any;
       if (pic?.uri) {
         onCapture(pic.uri, shot.key);
         smoother.current.reset();
@@ -120,6 +126,7 @@ export default function GuidedCameraNative({
       }
     } finally {
       setAnalysing(false);
+      busyRef.current = false;
     }
   }
 
@@ -147,6 +154,7 @@ export default function GuidedCameraNative({
           ref={(r) => { camRef.current = r; }}
           style={{ flex: 1 }}
           facing="back"
+          animateShutter={false}
           onCameraReady={() => setReady(true)}
         />
 

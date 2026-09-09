@@ -16,6 +16,7 @@ import ProductsTab from './src/screens/ProductsTab';
 import OrdersTab from './src/screens/OrdersTab';
 import ProfileTab from './src/screens/ProfileTab';
 import ProductDetail from './src/screens/ProductDetail';
+import * as drafts from './src/lib/drafts';
 import MarketplaceDetail from './src/screens/MarketplaceDetail';
 import Enquiries from './src/screens/Enquiries';
 import Create from './src/screens/Create';
@@ -49,8 +50,9 @@ type Stack =
 /** Offline and unsent-work notice, shown above every tab that reads from the server. */
 function SyncBanner() {
   const { t } = useI18n();
-  const { offline, pendingWrites } = useStore();
-  if (!offline && !pendingWrites) return null;
+  const { offline, pendingWrites, localDrafts } = useStore();
+  const waiting = pendingWrites + localDrafts.length;
+  if (!offline && !waiting) return null;
   return (
     <View style={{
       paddingHorizontal: S.lg, paddingVertical: 8,
@@ -59,12 +61,14 @@ function SyncBanner() {
     }}>
       <Text style={[T.micro, { fontSize: 12.5,
                                color: offline ? '#7A5B10' : C.moneyDeep }]}>
-        {offline ? t('sync.offline') : ''}
-        {offline && pendingWrites ? ' · ' : ''}
-        {pendingWrites
-          ? (pendingWrites === 1
-              ? t('sync.pending', { n: pendingWrites })
-              : t('sync.pendingPlural', { n: pendingWrites }))
+        {/* Offline is a state, not a failure - the app works either way. Saying so
+            in the same line is what stops it reading as "nothing works now". */}
+        {offline ? t('sync.offlineOk') : ''}
+        {offline && waiting ? ' · ' : ''}
+        {waiting
+          ? (waiting === 1
+              ? t('sync.pending', { n: waiting })
+              : t('sync.pendingPlural', { n: waiting }))
           : ''}
       </Text>
     </View>
@@ -110,6 +114,18 @@ function AppInner() {
   useEffect(() => {
     if (store.ready) setOnboarded(session.isOnboarded());
   }, [store.ready]);
+
+  /**
+   * Open a product.
+   *
+   * A listing that exists only on this phone has no server row behind it, so the
+   * detail page would have nothing to fetch. It opens in the create screen instead,
+   * resumed exactly as she left it, which is also the only place it can be finished.
+   */
+  const openProduct = useCallback((id: string) => {
+    if (drafts.isLocalId(id)) setStack({ screen: 'create', resumeId: id });
+    else setStack({ screen: 'product', id });
+  }, []);
 
   const backToTabs = useCallback(() => {
     setStack({ screen: 'tabs' });
@@ -200,7 +216,7 @@ function AppInner() {
                     session.setDraft(null);
                     setStack({ screen: 'create', resumeId: null });
                   }}
-                  onOpenProduct={(id) => setStack({ screen: 'product', id })}
+                  onOpenProduct={openProduct}
                   onResumeDraft={(id) => setStack({ screen: 'create', resumeId: id })}
                   onEnquiries={() => setStack({ screen: 'enquiries' })}
                   onLogin={() => setAuthOpen(true)}
@@ -215,7 +231,7 @@ function AppInner() {
                   loading={store.loading}
                   offline={store.offline}
                   lastSync={store.lastSync}
-                  onOpen={(id) => setStack({ screen: 'product', id })}
+                  onOpen={openProduct}
                   onLanguage={openLang}
                   onRefresh={store.refresh}
                 />
@@ -229,7 +245,7 @@ function AppInner() {
                   onLanguage={openLang}
                   onRefresh={store.refreshOrders}
                   onLogin={() => setAuthOpen(true)}
-                  onOpenProduct={(id) => setStack({ screen: 'product', id })}
+                  onOpenProduct={openProduct}
                   onShip={async (id) => {
                     try { await api.shipOrder(id); } catch { /* surfaced on refresh */ }
                     await store.refreshOrders();

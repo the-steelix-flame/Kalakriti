@@ -59,7 +59,7 @@ export function AiButton({
   const [steer, setSteer] = useState('');
 
   async function run(instruction = '') {
-    if (!listingId) { setErr(t('ai.needsPhotoFirst')); return; }
+    if (!listingId) { setErr(t('create.aiNeedsNet')); return; }
     setBusy(true); setErr(''); setValue('');
     try {
       const r = await api.assist({ listingId, field, instruction });
@@ -69,9 +69,15 @@ export function AiButton({
     } catch (e: any) {
       // 503 means the key is not set. Say that plainly rather than "something went
       // wrong" - it is a configuration problem somebody can actually fix.
-      setErr(e?.status === 503
-        ? t('ai.notConfigured')
-        : (e?.message || String(e)));
+      const msg = String(e?.message || e);
+      const networkish = e instanceof api.OfflineError
+        || /network request failed|fetch failed|connectexception|failed to connect|unable to resolve host|timed out|timeout|aborted|backend not reachable/i
+             .test(msg);
+      // No signal is not an error she caused, and it costs her nothing: the field
+      // stays hers and she can ask again later.
+      setErr(e?.status === 503 ? t('ai.notConfigured')
+           : networkish ? t('create.aiNeedsNet')
+           : msg);
     } finally {
       setBusy(false);
     }

@@ -26,6 +26,7 @@ import * as api from './api';
 import * as cache from './cache';
 import * as session from './session';
 import * as sync from './sync';
+import * as drafts from './drafts';
 import { hasBackend, resolve as resolveBackend } from './config';
 
 type Ctx = {
@@ -41,6 +42,8 @@ type Ctx = {
   jobs: api.Job[];
   jobsWorking: number;
   jobsReady: number;
+  /** Listings made on this phone that no backend has accepted yet. */
+  localDrafts: drafts.Draft[];
   summary: api.Summary | null;
   cards: api.Card[];
   orders: api.Order[];
@@ -90,6 +93,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   const [orders, setOrders] = useState<api.Order[]>([]);
   const [enquiries, setEnquiries] = useState<api.Enquiry[]>([]);
   const [insights, setInsights] = useState<api.Insights | null>(null);
+  const [localDrafts, setLocalDrafts] = useState<drafts.Draft[]>([]);
   const [jobs, setJobs] = useState<api.Job[]>([]);
   const [jobsWorking, setJobsWorking] = useState(0);
   const [jobsReady, setJobsReady] = useState(0);
@@ -139,6 +143,53 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   useEffect(() => sync.subscribe(() => setPending(sync.pending())), []);
+
+  /* --------------------------------------------------- drafts on this phone */
+
+  const reloadDrafts = useCallback(async () => {
+    setLocalDrafts((await drafts.unsynced()));
+  }, []);
+  useEffect(() => { reloadDrafts(); return drafts.subscribe(() => { reloadDrafts(); }); },
+            [reloadDrafts]);
+
+  /**
+   * Send up the listings made while there was no signal.
+   *
+   * One at a time and oldest first, because they were made in that order and a photo
+   * upload on a rural connection is not something to run six of at once. A draft that
+   * fails is left exactly where it is and tried again on the next refresh - it is on
+   * her phone, so there is no hurry and nothing at risk.
+   */
+  const uploadDrafts = useCallback(async () => {
+    const waiting = await drafts.unsynced();
+    for (const d of waiting) {
+      if (!d.imageUri) continue;
+      try {
+        const out = await api.analyze(d.imageUri, {
+          transcript: String(d.fields?.transcript || ''),
+          background: d.mode === 'manual' ? 'none' : 'studio',
+          skipModels: d.mode === 'manual',
+        } as any);
+        await drafts.patch(d.id, { serverId: out.listingId, syncState: 'synced' });
+        // Whatever she typed offline belongs on the row, not just the photograph.
+        const f = d.fields || {};
+        if (Object.keys(f).length) {
+          await api.updateListing(out.listingId, {
+            titleEn: f.titleEn ?? '', titleHi: f.titleHi ?? '',
+            descEn: f.descEn ?? '', descHi: f.descHi ?? '',
+            category: f.category ?? '', hsn: f.hsn ?? '',
+            price: Number(f.price) || 0, quantity: Number(f.quantity) || 1,
+            channelsSelected: Array.isArray(f.channelsSelected) ? f.channelsSelected : [],
+          } as any).catch(() => { /* the row exists; the edit retries through the queue */ });
+        }
+      } catch (e: any) {
+        // Offline again, or the server said no. Either way the draft stays.
+        await drafts.patch(d.id, { syncState: 'failed', lastError: String(e?.message || e) });
+        break;
+      }
+    }
+    await reloadDrafts();
+  }, [reloadDrafts]);
 
   /* -------------------------------------------------------- the queue */
 
@@ -194,6 +245,9 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       // Any queued edit goes out before we read, or the read would immediately
       // overwrite the artisan's own unsent change with the older server copy.
       await drain();
+      // Same reasoning for whole listings made offline: they go up before we ask the
+      // server what exists, otherwise they would be missing from the answer.
+      await uploadDrafts();
 
       const [b, sm, ls] = await Promise.allSettled([
         api.bootstrap(), api.summary(), api.listListings(),
@@ -222,7 +276,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       inflight.current = false;
       setLoading(false);
     }
-  }, [drain]);
+  }, [drain, uploadDrafts]);
 
   /**
    * Poll the server-side uploads.
@@ -344,19 +398,55 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     setConflicts(await sync.conflicts());
   }, []);
 
+  /**
+   * What My Products and Home show: the server's rows plus the ones still only on
+   * this phone. A listing an artisan finished in a place with no signal has to be
+   * visible in her own product list, or as far as she can tell it never happened.
+   */
+  const mergedCards = useMemo<api.Card[]>(
+    () => [...localDrafts.map(draftCard), ...cards], [localDrafts, cards]);
+
   const value = useMemo<Ctx>(() => ({
-    ready, online, offline, pendingWrites, conflicts,
-    artisan, readiness, summary, cards, orders, enquiries, insights,
+    ready, online, offline, pendingWrites, conflicts, localDrafts,
+    artisan, readiness, summary, cards: mergedCards, orders, enquiries, insights,
     jobs, jobsWorking, jobsReady,
     loading, lastSync,
     refresh, refreshOrders, refreshJobs, dismissJob,
     editListing, setArtisan, signOut, dismissConflict,
   }), [ready, online, offline, pendingWrites, conflicts, artisan, readiness, summary,
-       cards, orders, enquiries, insights, jobs, jobsWorking, jobsReady,
+       mergedCards, localDrafts, orders, enquiries, insights, jobs, jobsWorking, jobsReady,
        loading, lastSync, refresh, refreshOrders, refreshJobs, dismissJob,
        editListing, setArtisan, signOut, dismissConflict]);
 
   return <StoreCtx.Provider value={value}>{children}</StoreCtx.Provider>;
+}
+
+/**
+ * A local draft rendered as a product card.
+ *
+ * Everything that has not happened is honestly zero or null rather than absent:
+ * there are no views because nothing has been published, and `viewsAvailable` is
+ * false so the UI says so instead of showing a confident 0.
+ */
+function draftCard(d: drafts.Draft): api.Card {
+  const f = d.fields || {};
+  return {
+    id: d.id,
+    title: String(f.titleHi || f.titleEn || ''),
+    titleEn: String(f.titleEn || ''),
+    imageUrl: d.imageUri || '',
+    price: Number(f.price) || 0,
+    currency: 'INR',
+    quantity: Number(f.quantity) || 1,
+    category: String(f.category || ''),
+    status: 'draft', rawStatus: 'draft',
+    marketplaces: 0, marketplacesAttempted: 0,
+    channels: [], failedChannels: [],
+    views: null, viewsAvailable: false,
+    orders: 0, sold: 0, revenue: 0,
+    updatedAt: new Date(d.updatedAt).toISOString(),
+    createdAt: new Date(d.createdAt).toISOString(),
+  };
 }
 
 /** Only the card fields an edit can touch, so an optimistic update stays truthful. */

@@ -1,0 +1,54 @@
+# Render blueprint: a public HTTPS backend and a managed Postgres, from one file.
+#
+# `render blueprint launch`, or point Render at this repository.
+#
+# Read the plan lines before deploying. The free web-service tier gives 512 MB of
+# RAM; onnxruntime plus the U^2-Net weights need roughly 700 MB resident, so the
+# free instance will be OOM-killed on the first photograph. `starter` is the
+# smallest plan this actually runs on. The alternative, if the budget is genuinely
+# zero, is HEAVY_VISION=0 - see the note below.
+services:
+  - type: web
+    name: kalakriti-api
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: starter
+    healthCheckPath: /health
+    envVars:
+      - key: NVIDIA_API_KEY
+        sync: false                    # set in the dashboard; never in the repo
+      - key: DATABASE_URL
+        fromDatabase:
+          name: kalakriti-db
+          property: connectionString
+      - key: PUBLIC_BASE_URL
+        fromService:
+          type: web
+          name: kalakriti-api
+          property: host
+      - key: JWT_SECRET
+        generateValue: true
+      - key: VIEW_SALT
+        generateValue: true
+      # Images must not live on the container disk: it is wiped on every deploy.
+      - key: MEDIA_S3_ENDPOINT
+        sync: false
+      - key: MEDIA_S3_BUCKET
+        sync: false
+      - key: MEDIA_S3_KEY
+        sync: false
+      - key: MEDIA_S3_SECRET
+        sync: false
+      - key: MEDIA_PUBLIC_BASE
+        sync: false
+      # OTP delivery. Without these the server refuses to send a code rather than
+      # pretending to; OTP_DEV_ECHO must never be set here.
+      - key: MSG91_AUTH_KEY
+        sync: false
+      - key: MSG91_TEMPLATE_ID
+        sync: false
+
+databases:
+  - name: kalakriti-db
+    plan: basic-256mb
+    postgresMajorVersion: "16"

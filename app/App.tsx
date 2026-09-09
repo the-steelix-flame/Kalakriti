@@ -194,6 +194,8 @@ function AppInner() {
                   summary={store.summary}
                   insights={store.insights}
                   loading={store.loading}
+                  jobs={store.jobs}
+                  onDismissJob={store.dismissJob}
                   onNew={() => {
                     session.setDraft(null);
                     setStack({ screen: 'create', resumeId: null });

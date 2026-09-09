@@ -25,6 +25,7 @@ import hmac
 import html
 import io
 import json
+import logging
 import os
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -46,6 +47,9 @@ import logistics  # noqa: E402
 import seller  # noqa: E402
 import imaging  # noqa: E402
 import llm  # noqa: E402
+import jobs  # noqa: E402
+import media  # noqa: E402
+import pipeline  # noqa: E402
 import vision  # noqa: E402
 from routes_auth import router as auth_router
 
@@ -59,6 +63,35 @@ PUBLIC_BASE = os.getenv("PUBLIC_BASE_URL", "http://localhost:8000")
 os.makedirs(MEDIA_DIR, exist_ok=True)
 db.init()
 
+# A job left "running" belongs to a process that is no longer alive - a deploy, a
+# crash, an OOM kill. Without this it would say "working on it" forever, and the
+# artisan's upload would sit there unprocessed.
+_orphans = jobs.requeue_orphans()
+if _orphans:
+    logging.getLogger("main").warning(
+        "requeued %d job(s) left running by a previous process", _orphans)
+
+
+def _db_kind() -> dict:
+    """
+    Which database this process is actually talking to.
+
+    Worth surfacing: SQLite on a hosted container is a file on an ephemeral disk, so
+    every artisan, listing and order vanishes on the next deploy. That failure is
+    silent until somebody notices their account is gone, so it is reported here.
+    """
+    url = os.getenv("DATABASE_URL", "sqlite:///./kalakriti.db")
+    kind = url.split(":", 1)[0].split("+", 1)[0]
+    hosted = bool(os.getenv("RENDER") or os.getenv("FLY_APP_NAME")
+                  or os.getenv("RAILWAY_ENVIRONMENT"))
+    return {
+        "engine": kind,
+        "warning": ("SQLite on a hosted container sits on an ephemeral disk. Every "
+                    "account, listing and order is lost on the next deploy. Set "
+                    "DATABASE_URL to a Postgres connection string.")
+        if kind == "sqlite" and hosted else "",
+    }
+
 
 def _b64(raw: str) -> bytes:
     if raw.startswith("data:"):
@@ -67,14 +100,21 @@ def _b64(raw: str) -> bytes:
 
 
 def _save_media(img, listing_id: str, kind: str) -> str:
-    """Write an image to disk and return a real, openable URL on this server."""
-    name = f"{listing_id}_{kind}.jpg"
-    img.convert("RGB").save(os.path.join(MEDIA_DIR, name), "JPEG", quality=90, optimize=True)
-    return f"{PUBLIC_BASE}/media/{name}"
+    """
+    Store an image and return a URL that survives a redeploy.
+
+    Delegates to media.py, which uses object storage when it is configured and local
+    disk otherwise. It used to write to disk unconditionally, which is fine on a
+    laptop and quietly broken on any host with an ephemeral filesystem - the images
+    disappear on the next deploy, after the marketplace has already published the link.
+    """
+    return media.save(img, listing_id, kind)
 
 
 @app.get("/media/{name}")
-def media(name: str):
+def serve_media(name: str):
+    """Serve a locally stored image. Renamed from `media` because it
+    shadowed the media module and broke /health."""
     path = os.path.join(MEDIA_DIR, os.path.basename(name))
     if not os.path.exists(path):
         raise HTTPException(404, "not found")
@@ -98,6 +138,8 @@ def health() -> dict[str, Any]:
         "vlm": vision.VLM_MODEL if llm.available() else "not configured",
         "ocr": "rapidocr-onnxruntime (local)",
         "matting": "rembg/u2net (local)",
+        "media": media.status(),
+        "database": _db_kind(),
         "channels": channels.availability(),
         "logistics": logistics.availability(),
     }
@@ -111,6 +153,8 @@ class AnalyzeIn(BaseModel):
     lang: str = "hi-IN"
     background: str = "studio"      # studio | flux | none
     listingId: str | None = None
+    # Manual mode: keep the photograph, run no models. See pipeline.analyse_into.
+    skipModels: bool = False
 
 
 @app.post("/v1/analyze")
@@ -118,120 +162,45 @@ def analyze(body: AnalyzeIn,
             authorization: str | None = Header(None),
             x_guest_token: str | None = Header(None)) -> dict[str, Any]:
     """
-    One call runs the whole image pipeline and creates (or updates) a draft listing.
+    Run the whole image pipeline now, and return when it is finished.
 
-    enhance -> OCR -> vision detect -> matte -> background generation -> draft row
-
-    Returns the fields it is confident about separately from the ones it is not, so
-    the UI can pre-fill the former and merely suggest the latter. Nothing here is
-    hardcoded: if the model cannot identify the product, the fields come back empty
-    rather than as a sample product.
+    This is the fast-connection path. It holds the request open for two to five
+    minutes, which is fine on wifi and hopeless on 2G - a request that long will not
+    survive a village connection, and the artisan loses the upload. For that case use
+    POST /v1/jobs, which takes the photograph, returns an id immediately, and does the
+    same work here on the server. Both call pipeline.analyse_into, so there is one
+    implementation rather than two that drift.
     """
     data = _b64(body.imageBase64)
-    raw_hash = "sha256:" + hashlib.sha256(data).hexdigest()
-    t0 = datetime.now(timezone.utc)
 
     s = db.session()
     try:
         me = auth.artisan_from_token(s, authorization)
-        listing = None
-        if body.listingId:
-            listing = s.get(db.Listing, body.listingId)
+        listing = s.get(db.Listing, body.listingId) if body.listingId else None
         if listing is None:
             # A draft belongs to the account when there is one, and otherwise to the
             # device, so guest work survives until it can be claimed at login.
-            listing = db.Listing(id=db.nid("lst"), status="processing", raw_hash=raw_hash,
+            listing = db.Listing(id=db.nid("lst"), status="processing",
                                  artisan_id=me.id if me else None,
                                  guest_token="" if me else (x_guest_token or ""))
             s.add(listing)
+            s.commit()
         elif me and listing.artisan_id is None:
             listing.artisan_id = me.id
             db.log_event(s, "listing", listing.id, "status", "", "processing",
                          "image received")
-        lid = listing.id
 
-        ops: list[str] = []
-
-        # -- OCR (local, deterministic) ------------------------------------
-        ocr = vision.run_ocr(data)
-        ops.append(f"ocr:rapidocr {len(ocr.get('boxes', []))} text boxes")
-
-        # -- detection + image-grounded extraction --------------------------
-        analysis = vision.analyse(data, ocr=ocr, transcript=body.transcript)
-        mapped = (vision.apply_confident(analysis["fields"])
-                  if analysis.get("ok") else
-                  {"fields": {}, "suggestions": {}, "confidence": {}, "ocr_used": [],
-                   "notes": analysis.get("error", "")})
-        ops.append("detect:" + (vision.VLM_MODEL if analysis.get("ok")
-                                else f"failed ({analysis.get('error','')[:60]})"))
-
-        # -- matting + background generation --------------------------------
-        cut, mops = imaging.matte(data)
-        ops += mops
-        if cut is not None and body.background != "none":
-            hint = mapped["fields"].get("object") or mapped["suggestions"].get("object") or ""
-            final, bops = bg.compose(cut, provider=body.background, product_hint=str(hint))
-            ops += bops
-        else:
-            uri, eops = imaging.enhance(data)
-            ops += eops
-            final = imaging.Image.open(io.BytesIO(base64.b64decode(uri.split(",")[1])))
-
-        image_url = _save_media(final, lid, "final")
-        if cut is not None:
-            _save_media(cut, lid, "cut")
-
-        f = mapped["fields"]
-        listing.raw_hash = raw_hash
-        listing.image_url = image_url
-        listing.enhance_ops = ops
-        listing.vision = {"confidence": mapped["confidence"],
-                          "suggestions": mapped["suggestions"],
-                          "notes": mapped["notes"], "ocrUsed": mapped["ocr_used"],
-                          "model": analysis.get("model", "")}
-        listing.ocr = ocr
-        listing.transcript = body.transcript or listing.transcript
-        # Only fill blanks - never clobber something the artisan has already edited.
-        listing.title_en = listing.title_en or str(f.get("title", "") or "")
-        listing.desc_en = listing.desc_en or str(f.get("description", "") or "")
-        listing.category = listing.category or str(f.get("category", "") or "")
-        listing.hsn = listing.hsn or str(f.get("hsn", "") or "")
-        if not listing.price and isinstance(f.get("price"), (int, float)):
-            listing.price = float(f["price"])
-        attrs = dict(listing.attributes or {})
-        for k in ("materials", "colors", "dimensions", "craft", "object"):
-            if f.get(k) and not attrs.get(k):
-                attrs[k] = f[k]
-        listing.attributes = attrs
-        listing.status = "draft"
-        db.log_event(s, "listing", lid, "status", "processing", "draft",
-                     "analysis complete")
+        out = pipeline.analyse_into(
+            s, listing, data,
+            transcript=body.transcript,
+            background=body.background,
+            save_media=_save_media,
+            skip_models=body.skipModels,
+        )
         s.commit()
-
-        ms = int((datetime.now(timezone.utc) - t0).total_seconds() * 1000)
-        return {
-            "listingId": lid,
-            "imageUrl": image_url,
-            "rawHash": raw_hash,
-            "ops": ops,
-            "ms": ms,
-            "ocr": ocr,
-            "detected": f,
-            "suggestions": mapped["suggestions"],
-            "confidence": mapped["confidence"],
-            "notes": mapped["notes"],
-            "ocrUsed": mapped["ocr_used"],
-            "source": "vision" if analysis.get("ok") else "unavailable",
-            "listing": listing.public(),
-        }
+        return {**out, "listing": listing.public()}
     finally:
         s.close()
-
-
-# Kept for the existing Studio screen: enhancement only, unchanged behaviour.
-class EnhanceIn(BaseModel):
-    imageBase64: str
-    removeBackground: bool = True
 
 
 @app.post("/v1/enhance")
@@ -344,8 +313,23 @@ class PriceIn(BaseModel):
     listingId: str | None = None
 
 
+def _price_advice(catalog: dict | None, detected: dict | None,
+                  material_cost: float, days: float, wage_per_day: float) -> dict:
+    """
+    Costed price advice. Extracted from the route so "carry on with AI from here"
+    produces the identical numbers rather than a second, subtly different pricing.
+    """
+    return _price_impl(PriceIn(catalog=catalog, detected=detected,
+                               materialCost=material_cost, days=days,
+                               wagePerDay=wage_per_day))
+
+
 @app.post("/v1/price")
 def price(body: PriceIn) -> dict[str, Any]:
+    return _price_impl(body)
+
+
+def _price_impl(body: PriceIn) -> dict[str, Any]:
     material = float(body.materialCost)
     wage = float(body.days) * float(body.wagePerDay)
     overhead = round((material + wage) * 0.12)
@@ -1302,3 +1286,261 @@ def insights(authorization: str | None = Header(None)) -> dict[str, Any]:
 def marketplace_support() -> dict[str, Any]:
     """Which figures each platform can ever give us, so a blank can be explained."""
     return {"support": channels.metric_support(), "metrics": channels.METRICS}
+
+
+# ═════════════════════════════════ 8. slow connections: jobs and field assist
+#
+# Two ways to make a listing, chosen by the artisan, because the right answer depends
+# on a connection we cannot see from here.
+#
+#   auto    the photograph is uploaded once and this server does everything. The app
+#           can be closed. Results are collected later, cheapest bytes first.
+#   manual  she fills the form herself, and asks for AI one field at a time, or from
+#           any point onwards. Nothing is done to her listing that she did not ask for.
+#
+# Manual is not "AI off". Every model in the app is still available; the difference is
+# who starts it.
+
+
+class JobIn(BaseModel):
+    imageBase64: str
+    transcript: str = ""
+    lang: str = "hi-IN"
+    background: str = "studio"
+    listingId: str | None = None
+
+
+@app.post("/v1/jobs")
+def create_job(body: JobIn,
+               authorization: str | None = Header(None),
+               x_guest_token: str | None = Header(None)) -> dict[str, Any]:
+    """
+    Hand the server a photograph and stop waiting.
+
+    Returns in well under a second: the upload is stored and a worker picks it up.
+    The artisan can close the app, lose signal, or go and make another pot.
+    """
+    if not body.imageBase64:
+        raise HTTPException(400, "no image")
+    s = db.session()
+    try:
+        me = auth.artisan_from_token(s, authorization)
+        artisan_id = me.id if me else None
+    finally:
+        s.close()
+    return jobs.create(artisan_id, x_guest_token or "", body.imageBase64,
+                       {"transcript": body.transcript, "lang": body.lang,
+                        "background": body.background,
+                        "listingId": body.listingId})
+
+
+@app.get("/v1/jobs")
+def list_jobs(authorization: str | None = Header(None),
+              x_guest_token: str | None = Header(None)) -> dict[str, Any]:
+    """
+    The caller's own jobs. Small on purpose - this is polled, sometimes on a
+    connection that charges by the megabyte, so results are omitted here and fetched
+    per job once one is actually finished.
+    """
+    s = db.session()
+    try:
+        me = auth.artisan_from_token(s, authorization)
+        q = s.query(jobs.Job)
+        if me:
+            q = q.filter(jobs.Job.artisan_id == me.id)
+        elif x_guest_token:
+            q = q.filter(jobs.Job.guest_token == x_guest_token,
+                         jobs.Job.artisan_id.is_(None))
+        else:
+            return {"jobs": []}
+        rows = q.order_by(jobs.Job.created_at.desc()).limit(20).all()
+        return {"jobs": [j.public(with_result=False) for j in rows],
+                "working": sum(1 for j in rows if j.status in ("queued", "running")),
+                "ready": sum(1 for j in rows
+                             if j.status == "done" and not j.seen)}
+    finally:
+        s.close()
+
+
+@app.get("/v1/jobs/{jid}")
+def get_job(jid: str,
+            authorization: str | None = Header(None),
+            x_guest_token: str | None = Header(None)) -> dict[str, Any]:
+    s = db.session()
+    try:
+        j = s.get(jobs.Job, jid)
+        if not j:
+            raise HTTPException(404, "job not found")
+        me = auth.artisan_from_token(s, authorization)
+        if not jobs.owns(j, me.id if me else None, x_guest_token):
+            raise HTTPException(403, "that upload belongs to somebody else")
+        return j.public()
+    finally:
+        s.close()
+
+
+@app.post("/v1/jobs/{jid}/seen")
+def mark_job_seen(jid: str,
+                  authorization: str | None = Header(None),
+                  x_guest_token: str | None = Header(None)) -> dict[str, Any]:
+    """The artisan has looked at the finished result, so stop announcing it."""
+    s = db.session()
+    try:
+        j = s.get(jobs.Job, jid)
+        if not j:
+            raise HTTPException(404, "job not found")
+        me = auth.artisan_from_token(s, authorization)
+        if not jobs.owns(j, me.id if me else None, x_guest_token):
+            raise HTTPException(403, "that upload belongs to somebody else")
+        j.seen = 1
+        s.commit()
+        return {"ok": True}
+    finally:
+        s.close()
+
+
+ASSIST_FIELDS = {
+    "title": ("Write one product title, 8 to 14 words, plain and specific. Say what the "
+              "object is, its material and its most visible feature. No marketing "
+              "adjectives, no exclamation marks.",
+              "titleEn"),
+    "titleHi": ("Write one product title in Hindi, 8 to 14 words, plain and specific.",
+                "titleHi"),
+    "description": ("Write 3 to 5 sentences describing this handmade product for a "
+                    "buyer: what it is, what it is made of, how it was made, what it is "
+                    "for. Concrete and honest. Never invent a measurement, a material "
+                    "or a certification you were not given.",
+                    "descEn"),
+    "descriptionHi": ("Write 3 to 5 sentences in Hindi describing this handmade product "
+                      "for a buyer. Never invent details you were not given.",
+                      "descHi"),
+    "category": ("Give one retail category path, like "
+                 "'Home & Kitchen > Kitchenware > Water Pitchers'. Nothing else.",
+                 "category"),
+    "hsn": ("Give the most likely 4-digit or 6-digit Indian HSN code for this product, "
+            "as digits only. If you are not reasonably sure, return an empty string "
+            "rather than guessing.",
+            "hsn"),
+    "tags": ("Give 6 to 8 short search keywords a buyer would actually type. "
+             "Return them as a JSON array of strings.",
+             "tags"),
+}
+
+ASSIST_SYSTEM = """You help an Indian artisan write one field of a product listing.
+
+Ground every word in what you are given: the photograph analysis, the text read off
+the product, and what the artisan said. If the information is not there, say less -
+never invent a material, a measurement, a place of origin or a certification.
+
+Return JSON: {"value": <the field>, "note": "<one short sentence on what you used>"}"""
+
+
+class AssistIn(BaseModel):
+    listingId: str
+    field: str
+    instruction: str = ""       # optional steer, e.g. "make it shorter"
+
+
+@app.post("/v1/assist")
+def assist(body: AssistIn,
+           authorization: str | None = Header(None),
+           x_guest_token: str | None = Header(None)) -> dict[str, Any]:
+    """
+    Fill one field with AI, on request.
+
+    This is what makes manual mode a choice rather than a downgrade. Every model the
+    automatic path uses is still here; the artisan decides which field, and when. The
+    result is returned rather than written, so nothing changes on her listing until
+    she accepts it.
+    """
+    if body.field not in ASSIST_FIELDS:
+        raise HTTPException(400,
+                            f"unknown field {body.field}; "
+                            f"expected one of {', '.join(ASSIST_FIELDS)}")
+    if not llm.available():
+        raise HTTPException(503, {"error": "llm_not_configured",
+                                  "message": "Set NVIDIA_API_KEY to use AI help."})
+    s = db.session()
+    try:
+        lst, _ = _own_listing(s, body.listingId, authorization, x_guest_token)
+        task, _col = ASSIST_FIELDS[body.field]
+
+        # Everything known about this product, and nothing about any other.
+        ctx = {
+            "whatTheModelSawInThePhoto": (lst.vision or {}).get("suggestions", {}),
+            "textReadOffTheProduct": (lst.ocr or {}).get("text", "")[:900],
+            "whatTheArtisanSaid": lst.transcript or "",
+            "currentTitle": lst.title_en or lst.title_hi or "",
+            "currentDescription": (lst.desc_en or "")[:600],
+            "category": lst.category, "attributes": lst.attributes or {},
+        }
+        prompt = (task
+                  + ("\n\nThe artisan also asks: " + body.instruction[:300]
+                     if body.instruction.strip() else "")
+                  + "\n\nWhat is known about this product:\n"
+                  + json.dumps(ctx, ensure_ascii=False)[:3000])
+        out = llm.chat_json(ASSIST_SYSTEM, prompt, max_tokens=1200)
+        return {"field": body.field, "value": out.get("value", ""),
+                "note": out.get("note", ""), "source": "nemotron"}
+    finally:
+        s.close()
+
+
+class ContinueIn(BaseModel):
+    listingId: str
+    from_step: str = "catalog"      # catalog | price | picture | all
+
+
+@app.post("/v1/assist/continue")
+def assist_continue(body: ContinueIn,
+                    authorization: str | None = Header(None),
+                    x_guest_token: str | None = Header(None)) -> dict[str, Any]:
+    """
+    "Carry on with AI from here."
+
+    Runs the remaining steps in one go and returns them as suggestions, leaving every
+    field the artisan has already filled exactly as she typed it. Whatever she wrote
+    is the ground truth the model works from, not something to be improved.
+    """
+    if not llm.available():
+        raise HTTPException(503, {"error": "llm_not_configured",
+                                  "message": "Set NVIDIA_API_KEY to use AI help."})
+    s = db.session()
+    try:
+        lst, _ = _own_listing(s, body.listingId, authorization, x_guest_token)
+        done: dict[str, Any] = {}
+
+        if body.from_step in ("catalog", "all"):
+            parts = []
+            if lst.vision:
+                parts.append("Vision model saw:\n"
+                             + json.dumps((lst.vision or {}).get("suggestions", {}),
+                                          ensure_ascii=False)[:1500])
+            if (lst.ocr or {}).get("text"):
+                parts.append("OCR read on the product:\n" + lst.ocr["text"][:900])
+            if lst.transcript:
+                parts.append(f'The artisan said:\n"{lst.transcript[:800]}"')
+            # Anything she has already written is context, not something to replace.
+            typed = {k: v for k, v in {
+                "title": lst.title_en or lst.title_hi,
+                "description": lst.desc_en or lst.desc_hi,
+                "category": lst.category}.items() if v}
+            if typed:
+                parts.append("The artisan has already written these, keep them "
+                             "consistent and do not contradict them:\n"
+                             + json.dumps(typed, ensure_ascii=False))
+            if parts:
+                done["catalog"] = llm.chat_json(CATALOG_SYSTEM, "\n\n".join(parts))
+
+        if body.from_step in ("price", "catalog", "all"):
+            cat = done.get("catalog") or {"titleEn": lst.title_en,
+                                          "category": lst.category}
+            try:
+                done["price"] = _price_advice(cat, (lst.vision or {}), 1400, 3, 650)
+            except Exception as e:
+                done["price"] = {"error": f"{type(e).__name__}: {e}"}
+
+        return {"listingId": lst.id, "suggestions": done,
+                "note": "Nothing was saved. Accept the parts you want."}
+    finally:
+        s.close()

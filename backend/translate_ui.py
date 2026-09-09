@@ -18,6 +18,7 @@ import json
 import os
 import re
 import sys
+import time
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -96,12 +97,23 @@ def translate(lang_code: str, lang_name: str, en: dict, hi: dict) -> dict:
         prompt = (f"Translate these {len(chunk)} interface strings into {lang_name}.\n\n"
                   + json.dumps(payload, ensure_ascii=False, indent=1))
         got = {}
-        for attempt in range(3):
+        for attempt in range(6):
             try:
                 got = llm.chat_json(SYSTEM.format(lang=lang_name), prompt, max_tokens=6000)
                 break
             except Exception as e:
-                print(f"    batch {bi} attempt {attempt + 1} failed: {e}", flush=True)
+                msg = str(e)
+                # 503 "Service temporarily overloaded" and 429 are transient. Retrying
+                # immediately just adds to the pile, and giving up writes English into
+                # the file - which then looks like a finished translation. Back off
+                # instead: 20s, 40s, 80s, ...
+                transient = "503" in msg or "429" in msg or "overload" in msg.lower()
+                wait = min(20 * (2 ** attempt), 300) if transient else 5
+                print(f"    batch {bi} attempt {attempt + 1} failed "
+                      f"({'transient, waiting %ds' % wait if transient else 'giving up soon'}): "
+                      f"{msg[:120]}", flush=True)
+                if attempt < 5:
+                    time.sleep(wait)
         bad = 0
         for k in chunk:
             v = got.get(k)

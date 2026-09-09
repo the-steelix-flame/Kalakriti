@@ -20,6 +20,7 @@ export type Metric = {
   value: number | null;
   available: boolean;
   why: string;
+  config?: string;
   source: string;
 };
 
@@ -57,6 +58,15 @@ export function MetricTile({
                 numberOfLines={open ? undefined : 2}>
             {open ? metric?.why : t('mp.whyBlank')}
           </Text>
+          {/* The exact variables an operator must set. Shown only when expanded, and
+              in a quieter style, because an artisan is not the audience for
+              AMZN_LWA_CLIENT_ID - but somebody deploying this does need it. */}
+          {open && metric?.config ? (
+            <Text style={{ fontFamily: 'Courier', fontSize: 10, color: C.inkSoft,
+                           marginTop: 4 }}>
+              {metric.config}
+            </Text>
+          ) : null}
         </>
       )}
       {has && metric?.source ? (

@@ -20,6 +20,7 @@ const K = {
   onboarded: 'kk.onboarded',
   artisan: 'kk.artisan',          // cached profile, for offline first paint
   hideInsights: 'kk.hideInsights',
+  mode: 'kk.mode',                // auto | manual, how a listing gets made
 };
 
 // Values from the previous build, so an existing install is not logged out or asked
@@ -45,7 +46,8 @@ const read = (k: string) => mirror.get(k) ?? null;
  */
 export async function hydrate(): Promise<void> {
   if (hydrated) return;
-  const plain = [K.lang, K.guest, K.draft, K.onboarded, K.artisan, K.hideInsights];
+  const plain = [K.lang, K.guest, K.draft, K.onboarded, K.artisan,
+                 K.hideInsights, K.mode];
   const [vals, token] = await Promise.all([
     Promise.all(plain.map((k) => store.get(k))),
     store.getSecure(K.token),
@@ -86,6 +88,22 @@ export const setOnboarded = () => put(K.onboarded, '1');
 
 export const insightsHidden = () => read(K.hideInsights) === '1';
 export const setInsightsHidden = (v: boolean) => put(K.hideInsights, v ? '1' : null);
+
+/**
+ * How a listing gets made.
+ *
+ *   auto    the photograph is uploaded once, the server does everything, and the app
+ *           can be closed. Built for a connection that cannot hold a five-minute
+ *           request open.
+ *   manual  the artisan fills the form herself and asks for AI where she wants it.
+ *
+ * Unset until she chooses. The app then proposes one based on the connection it can
+ * actually see, and she can change it at any time - a measured speed is a guess about
+ * the next minute, not a decision to take out of her hands.
+ */
+export type Mode = 'auto' | 'manual';
+export const getMode = () => (read(K.mode) as Mode | null);
+export const setMode = (m: Mode | null) => put(K.mode, m);
 
 /** Last known profile, so Home can greet the artisan before the network answers. */
 export function getArtisan<T>(): T | null {

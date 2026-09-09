@@ -263,7 +263,8 @@ def insights(s, artisan_id: str | None) -> dict:
     is not enough data yet, this returns `enough: False` and the app says so instead
     of dressing up thin data as a trend.
     """
-    since = datetime.now(timezone.utc) - timedelta(days=180)
+    # Naive UTC, to match how every timestamp is stored. See db.now().
+    since = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=180)
     rows = (s.query(db.Listing.category, db.Listing.price, db.Listing.artisan_id)
             .filter(db.Listing.status.in_(["published", "active", "sold"]),
                     db.Listing.artisan_id.isnot(None),

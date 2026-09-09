@@ -24,6 +24,7 @@ import {
   Plus, Camera, Rupee, Globe, Users, Trend, Warning, Tag, Check,
 } from '../icons';
 import { TabScreen } from '../nav/Shell';
+import { JobList } from '../ui/JobCard';
 import { useI18n } from '../i18n';
 import { ago } from '../lib/ago';
 import * as api from '../lib/api';
@@ -73,9 +74,12 @@ function QuickAction({ icon, label, onPress }: {
 /* -------------------------------------------------------------------- home */
 
 export default function HomeTab({
-  artisan, summary, insights, loading, onNew, onOpenProduct, onResumeDraft,
+  artisan, summary, insights, loading, jobs, onDismissJob,
+  onNew, onOpenProduct, onResumeDraft,
   onEnquiries, onLogin, onLanguage, onTab, onRefresh,
 }: {
+  jobs: api.Job[];
+  onDismissJob: (id: string) => void;
   artisan: api.Artisan | null;
   summary: api.Summary | null;
   insights: api.Insights | null;
@@ -113,6 +117,13 @@ export default function HomeTab({
     >
       <Btn label={t('home.addProduct')} sub={t('home.addProductSub')}
            icon={<Plus color={C.white} size={26} />} onPress={onNew} large />
+
+      {/*
+        Photographs the server is still working through, and finished ones she has not
+        seen. This sits above everything because it is the answer to "what happened to
+        the photo I sent?" - the question she opens the app with after handing one off.
+      */}
+      <JobList jobs={jobs} onOpen={onOpenProduct} onDismiss={onDismissJob} />
 
       {/* ── needs you ──────────────────────────────────────────────────── */}
       {actions.length ? (

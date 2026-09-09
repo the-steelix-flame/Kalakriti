@@ -277,7 +277,10 @@ export const shipOrder = (oid: string) =>
 export type Metric = {
   value: number | null;
   available: boolean;
+  /** Written for the artisan: what this platform does or does not share. */
   why: string;
+  /** Operator-facing: the exact environment variables still needed, if any. */
+  config?: string;
   source: string;
 };
 
@@ -361,3 +364,70 @@ export const marketplaceDetail = (id: string, channel: string) =>
 export const listEnquiries = () => get<{ enquiries: Enquiry[] }>('/v1/enquiries');
 export const replyEnquiry = (id: string, body: { reply?: string; status?: string }) =>
   patch<Enquiry>(`/v1/enquiries/${id}`, body);
+
+/* ────────────────────────────────── slow connections: jobs and field assist */
+
+export type Job = {
+  id: string;
+  kind: string;
+  status: 'queued' | 'running' | 'done' | 'failed' | 'cancelled';
+  stage: string;
+  progress: number;
+  listingId: string;
+  error: string;
+  seen: boolean;
+  createdAt?: string; updatedAt?: string; finishedAt?: string;
+  result?: {
+    listingId: string;
+    titleEn: string; titleHi: string; descEn: string;
+    category: string; hsn: string;
+    price: number; floorPrice: number;
+    attributes: Record<string, any>;
+    ocrText: string;
+    confidence: Record<string, number>;
+    suggestions: Record<string, any>;
+    notes: string;
+    thumbUrl: string; imageUrl: string;
+    ms: number;
+  };
+};
+
+/**
+ * Hand the server a photograph and stop waiting.
+ *
+ * Returns in well under a second. The artisan can close the app; the work carries on
+ * without her. This is the path that survives a connection which cannot hold a
+ * five-minute request open, which is most of them.
+ */
+export const createJob = (b: {
+  imageBase64: string; transcript?: string; lang?: string;
+  background?: string; listingId?: string | null;
+}) => post<Job>('/v1/jobs', b, 120000);
+
+/** Deliberately small: this is polled, sometimes on a connection billed by the MB. */
+export const listJobs = () =>
+  get<{ jobs: Job[]; working: number; ready: number }>('/v1/jobs');
+
+export const getJob = (id: string) => get<Job>(`/v1/jobs/${id}`);
+export const markJobSeen = (id: string) => post<{ ok: boolean }>(`/v1/jobs/${id}/seen`, {});
+
+export type AssistField =
+  | 'title' | 'titleHi' | 'description' | 'descriptionHi'
+  | 'category' | 'hsn' | 'tags';
+
+/**
+ * Fill one field with AI, on request.
+ *
+ * The result is returned, never written: nothing changes on the listing until the
+ * artisan accepts it. That is what makes manual mode a choice rather than a lesser
+ * version of the app - every model is still here, she decides which and when.
+ */
+export const assist = (b: { listingId: string; field: AssistField;
+                            instruction?: string }) =>
+  post<{ field: string; value: any; note: string; source: string }>(
+    '/v1/assist', b, 300000);
+
+/** "Carry on with AI from here" - the remaining steps, as suggestions. */
+export const assistContinue = (b: { listingId: string; from_step?: string }) =>
+  post<{ listingId: string; suggestions: Record<string, any>; note: string }>(
+    '/v1/assist/continue', b, 600000);

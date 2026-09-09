@@ -235,6 +235,9 @@ backend/
   logistics.py       Shiprocket / Delhivery, tracking webhooks
   db.py              SQLAlchemy models
   analytics.py       view counting, product cards, home summary, insights
+  pipeline.py        the image pipeline, shared by /v1/analyze and the job worker
+  jobs.py            server-side processing, so a 2G upload survives
+  media.py           object storage (S3-compatible) with a local-disk fallback
   translate_ui.py    regenerates the UI translations
 
 app/
@@ -248,10 +251,16 @@ app/
   src/lib/cache.ts   last known good copy of every list
   src/lib/sync.ts    offline write queue, field-level conflicts
   src/lib/store.tsx  the data layer every screen reads from
+  src/lib/connection.ts   measures the link, to propose auto or manual
+  src/ui/AiButton.tsx     per-field AI: suggest, never overwrite
   plugins/           Expo config plugin for LAN cleartext
 
 docs/ON-DEVICE.md       what runs on the phone and why
 docs/ARCHITECTURE.md    storage, offline sync, and which figures are real
+docs/DEPLOY.md          Postgres, object storage, HTTPS - taking it off the laptop
+
+Kalakriti_Strategy_and_Build.pdf   the full document, 24 pages
+Kalakriti_Team_Modules.pdf         the five-module split, one owner each
 ```
 
 ---

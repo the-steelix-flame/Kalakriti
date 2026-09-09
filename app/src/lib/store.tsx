@@ -37,6 +37,10 @@ type Ctx = {
 
   artisan: api.Artisan | null;
   readiness: api.Readiness[];
+  /** Uploads this server is still working through, and finished ones not yet seen. */
+  jobs: api.Job[];
+  jobsWorking: number;
+  jobsReady: number;
   summary: api.Summary | null;
   cards: api.Card[];
   orders: api.Order[];
@@ -47,6 +51,8 @@ type Ctx = {
   lastSync: number | null;
 
   refresh: (opts?: { silent?: boolean }) => Promise<void>;
+  refreshJobs: () => Promise<void>;
+  dismissJob: (id: string) => Promise<void>;
   refreshOrders: () => Promise<void>;
   editListing: (id: string, fields: Record<string, any>,
                 baseUpdatedAt?: string | null) => Promise<void>;
@@ -84,6 +90,9 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   const [orders, setOrders] = useState<api.Order[]>([]);
   const [enquiries, setEnquiries] = useState<api.Enquiry[]>([]);
   const [insights, setInsights] = useState<api.Insights | null>(null);
+  const [jobs, setJobs] = useState<api.Job[]>([]);
+  const [jobsWorking, setJobsWorking] = useState(0);
+  const [jobsReady, setJobsReady] = useState(0);
   const [loading, setLoading] = useState(false);
   const [lastSync, setLastSync] = useState<number | null>(null);
 
@@ -205,6 +214,48 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     }
   }, [drain]);
 
+  /**
+   * Poll the server-side uploads.
+   *
+   * Kept separate from the main refresh and deliberately small - it runs on a timer
+   * while something is in flight, sometimes on a connection billed by the megabyte,
+   * so it fetches statuses without results and pulls a result only when one is done.
+   */
+  const refreshJobs = useCallback(async () => {
+    try {
+      const r = await api.listJobs();
+      setJobs(r.jobs || []);
+      setJobsWorking(r.working || 0);
+      setJobsReady(r.ready || 0);
+      // A finished job means there is a new draft; bring the product list in line so
+      // it appears without the artisan having to pull to refresh.
+      if ((r.ready || 0) > 0) {
+        const ls = await api.listListings().catch(() => null);
+        if (ls) {
+          setCards(ls.cards || []);
+          await cache.write(cache.K.listings, ls.cards || []);
+        }
+      }
+    } catch { /* offline: the card keeps showing the last known state */ }
+  }, []);
+
+  const dismissJob = useCallback(async (id: string) => {
+    try { await api.markJobSeen(id); } catch { /* it will be marked on the next poll */ }
+    setJobs((js) => js.map((j) => (j.id === id ? { ...j, seen: true } : j)));
+    setJobsReady((n) => Math.max(0, n - 1));
+  }, []);
+
+  /**
+   * While work is in flight, check every 15 seconds. Nothing in flight, no polling -
+   * a timer that runs forever on a metered connection is somebody's money.
+   */
+  useEffect(() => {
+    if (!ready) return;
+    if (!jobsWorking) return;
+    const id = setInterval(() => { refreshJobs(); }, 15000);
+    return () => clearInterval(id);
+  }, [ready, jobsWorking, refreshJobs]);
+
   const refreshOrders = useCallback(async () => {
     try {
       const [o, e, i] = await Promise.allSettled([
@@ -225,12 +276,14 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     } catch { /* cached rows stay on screen */ }
   }, []);
 
-  useEffect(() => { if (ready) { refresh(); refreshOrders(); } }, [ready]);
+  useEffect(() => {
+    if (ready) { refresh(); refreshOrders(); refreshJobs(); }
+  }, [ready]);
 
   /* Coming back to the foreground is the usual moment connectivity returns. */
   useEffect(() => {
     const sub = AppState.addEventListener('change', (st) => {
-      if (st === 'active' && ready) refresh({ silent: true });
+      if (st === 'active' && ready) { refresh({ silent: true }); refreshJobs(); }
     });
     return () => sub.remove();
   }, [ready, refresh]);
@@ -270,6 +323,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     await cache.clear();
     setArtisanState(null);
     setCards([]); setOrders([]); setEnquiries([]); setSummary(null);
+    setJobs([]); setJobsWorking(0); setJobsReady(0);
     setConflicts([]);
   }, []);
 
@@ -281,11 +335,14 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   const value = useMemo<Ctx>(() => ({
     ready, online, offline, pendingWrites, conflicts,
     artisan, readiness, summary, cards, orders, enquiries, insights,
+    jobs, jobsWorking, jobsReady,
     loading, lastSync,
-    refresh, refreshOrders, editListing, setArtisan, signOut, dismissConflict,
+    refresh, refreshOrders, refreshJobs, dismissJob,
+    editListing, setArtisan, signOut, dismissConflict,
   }), [ready, online, offline, pendingWrites, conflicts, artisan, readiness, summary,
-       cards, orders, enquiries, insights, loading, lastSync,
-       refresh, refreshOrders, editListing, setArtisan, signOut, dismissConflict]);
+       cards, orders, enquiries, insights, jobs, jobsWorking, jobsReady,
+       loading, lastSync, refresh, refreshOrders, refreshJobs, dismissJob,
+       editListing, setArtisan, signOut, dismissConflict]);
 
   return <StoreCtx.Provider value={value}>{children}</StoreCtx.Provider>;
 }

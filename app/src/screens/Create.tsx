@@ -21,6 +21,9 @@ import { ShotPlan } from './shotPlan';
 import { CATEGORIES, CategoryKey } from '../vision/guidance';
 import { useI18n } from '../i18n';
 import { useStore } from '../lib/store';
+import * as connection from '../lib/connection';
+import { AiButton, Spark } from '../ui/AiButton';
+import ModeSheet from './ModeSheet';
 import { listen, isSupported, LANGS, Listener } from '../lib/speech';
 
 /**
@@ -40,6 +43,39 @@ const STEPS = [
   'create.step.price', 'create.step.channels', 'create.step.live',
 ];
 
+
+/**
+ * A form field with an "ask the AI for this one" button in its label row.
+ *
+ * The button sits beside the label rather than inside the input, so it never covers
+ * what she is typing and is reachable with a thumb on a small screen.
+ */
+function FieldWithAi({
+  label, value, onChange, listingId, field, multiline, confidence, placeholder, numeric,
+}: {
+  label: string;
+  value: string;
+  onChange: (v: string) => void;
+  listingId: string | null;
+  field: api.AssistField;
+  multiline?: boolean;
+  confidence?: number;
+  placeholder?: string;
+  numeric?: boolean;
+}) {
+  return (
+    <View style={{ gap: 4 }}>
+      <View style={{ flexDirection: 'row', alignItems: 'center', gap: S.sm }}>
+        <Text style={[T.label, { flex: 1 }]}>{label}</Text>
+        <AiButton listingId={listingId} field={field} current={value}
+                  onAccept={onChange} />
+      </View>
+      <Field label="" value={value} onChange={onChange} multiline={multiline}
+             confidence={confidence} placeholder={placeholder} numeric={numeric} />
+    </View>
+  );
+}
+
 export default function Create({
   onHome, resumeId,
 }: { onHome: () => void; resumeId?: string | null }) {
@@ -49,6 +85,8 @@ export default function Create({
   const [analysis, setAnalysis] = useState<api.AnalyzeOut | null>(null);
   const [busy, setBusy] = useState<string>('');
   const [err, setErr] = useState('');
+  /** A one-line confirmation, e.g. after AI fills the blanks. */
+  const [notice, setNotice] = useState('');
 
   const [titleEn, setTitleEn] = useState('');
   const [titleHi, setTitleHi] = useState('');
@@ -79,6 +117,22 @@ export default function Create({
   const store = useStore();
   /** The row version the current edits were made against. */
   const baseVersion = useRef<string | null>(null);
+
+  /**
+   * How this listing gets made.
+   *
+   *   auto    the photo goes to the server and the AI fills everything in
+   *   manual  the artisan writes it, and asks for AI per field when she wants it
+   *
+   * Unset means she has never chosen; the sheet opens on the first photograph and
+   * proposes one based on the connection. Her choice is remembered after that.
+   */
+  const [mode, setModeState] = useState<session.Mode>(session.getMode() ?? 'auto');
+  const [modeAsk, setModeAsk] = useState(false);
+  const [handedOff, setHandedOff] = useState(false);   // sent to the server as a job
+  const [aiBusy, setAiBusy] = useState('');
+  /** Held while the mode sheet is open, so the answer resumes the capture. */
+  const pendingPhoto = useRef<string | null>(null);
   const insets = useSafeAreaInsets();
   const [lang, setLang] = useState(locale);
   useEffect(() => { setLang(locale); }, [locale]);
@@ -201,7 +255,7 @@ export default function Create({
       const r = await ImagePicker.launchImageLibraryAsync({ quality: 0.9 });
       if (!r.canceled && r.assets?.[0]) {
         setRawUri(r.assets[0].uri);
-        runAnalyze(r.assets[0].uri);
+        handlePhoto(r.assets[0].uri);
       }
     } catch (e: any) {
       setErr(String(e?.message || e));
@@ -215,12 +269,77 @@ export default function Create({
     if (first) {
       setRawUri(uri);
       setCamOpen(false);
-      runAnalyze(uri);
+      handlePhoto(uri);
       // Say why another photo helps, without forcing one.
       setShotHint(planRef.current.nextShotKey());
     } else {
       setCamOpen(false);
       setShotHint(planRef.current.nextShotKey());
+    }
+  }
+
+  /**
+   * What happens to a photograph, which depends on the connection.
+   *
+   * On a good connection the pipeline runs inline and the artisan watches it. On
+   * anything slower the photograph is handed to the server as a job and she is free
+   * to leave - a five-minute HTTP request does not survive 2G, and when it dies she
+   * pays for the upload twice.
+   *
+   * In manual mode nothing is sent for analysis at all. The photograph is attached to
+   * the draft so the AI buttons have something to look at, and she writes the listing.
+   */
+  async function handlePhoto(uri: string) {
+    if (!session.getMode()) { pendingPhoto.current = uri; setModeAsk(true); return; }
+    if (mode === 'manual') { await attachOnly(uri); return; }
+
+    const reading = await connection.measure();
+    if (connection.useBackgroundJob(reading)) { await sendAsJob(uri); return; }
+    await runAnalyze(uri);
+  }
+
+  /**
+   * Manual mode: keep the photograph, run nothing.
+   *
+   * The draft is created with the image so /v1/assist has context, but no model is
+   * called until she taps an AI button. That is the promise manual mode makes.
+   */
+  async function attachOnly(uri: string) {
+    setBusy(t('create.saving'));
+    setErr('');
+    try {
+      const out = await api.analyze(uri, {
+        transcript, lang, background: 'none', listingId: listingId ?? undefined,
+        skipModels: true,
+      } as any);
+      setAnalysis(out);
+      setListingId(out.listingId);
+    } catch (e: any) {
+      setErr(String(e?.message || e));
+    } finally {
+      setBusy('');
+    }
+  }
+
+  /** Auto mode on a slow connection: upload once, walk away. */
+  async function sendAsJob(uri: string) {
+    setBusy(t('job.sent'));
+    setErr('');
+    try {
+      const b64 = await api.toBase64(uri);
+      const job = await api.createJob({
+        imageBase64: b64, transcript, lang, background: 'studio',
+        listingId: listingId ?? undefined,
+      });
+      setHandedOff(true);
+      store.refreshJobs();
+      // She does not have to stay here. Home carries the progress card.
+      setTimeout(() => onHome(), 1800);
+      return job;
+    } catch (e: any) {
+      setErr(String(e?.message || e));
+    } finally {
+      setBusy('');
     }
   }
 
@@ -246,6 +365,44 @@ export default function Create({
       setErr(String(e?.message || e));
     } finally {
       setBusy('');
+    }
+  }
+
+  /**
+   * "Carry on with AI from here."
+   *
+   * Runs the remaining steps and applies only what is still blank. Anything she has
+   * typed is left exactly as she typed it - the server is told what she wrote so the
+   * suggestions stay consistent with it rather than contradicting her.
+   */
+  async function continueWithAi() {
+    if (!listingId) { setErr(t('ai.needsPhotoFirst')); return; }
+    setAiBusy('continue');
+    setErr('');
+    try {
+      const r = await api.assistContinue({ listingId, from_step: 'catalog' });
+      const cat = r.suggestions?.catalog || {};
+      setTitleEn((v) => v || String(cat.titleEn ?? ''));
+      setTitleHi((v) => v || String(cat.titleHi ?? ''));
+      setDescEn((v) => v || String(cat.descEn ?? ''));
+      setDescHi((v) => v || String(cat.descHi ?? ''));
+      setCategory((v) => v || String(cat.category ?? ''));
+      setHsn((v) => v || String(cat.hsn ?? ''));
+      const pr = r.suggestions?.price;
+      if (pr && typeof pr.suggested === 'number') {
+        setPriceStr((v) => v || String(pr.suggested));
+        if (Array.isArray(pr.breakdown) && !breakdownDirty) {
+          setBreakdown(pr.breakdown.map((b: any, i: number) => ({
+            id: `ai${i}`, label: String(b.label), amount: String(b.amount),
+          })));
+        }
+        if (!rationaleDirty && pr.rationale) setRationale(String(pr.rationale));
+      }
+      setNotice(t('ai.continueDone'));
+    } catch (e: any) {
+      setErr(e?.status === 503 ? t('ai.notConfigured') : String(e?.message || e));
+    } finally {
+      setAiBusy('');
     }
   }
 
@@ -489,6 +646,31 @@ export default function Create({
           </Card>
         ) : null}
 
+        {notice ? (
+          <Card tone="money">
+            <View style={{ flexDirection: 'row', gap: S.sm, alignItems: 'center' }}>
+              <Check color={C.money} size={20} />
+              <Text style={[T.bodySoft, { flex: 1, color: C.ink }]}>{notice}</Text>
+            </View>
+          </Card>
+        ) : null}
+
+        {/* How this listing is being made, and a one-tap way to change it. Visible
+            rather than buried in settings: the choice changes what the app does with
+            her photograph, so she should be able to see which one is active. */}
+        <Pressable onPress={() => setModeAsk(true)} accessibilityRole="button"
+                   accessibilityLabel={t('mode.change')}>
+          <View style={{ flexDirection: 'row', alignItems: 'center', gap: S.sm,
+                         paddingVertical: 6 }}>
+            <Spark size={14} color={mode === 'auto' ? C.indigo : C.inkSoft} />
+            <Text style={[T.micro, { flex: 1, fontSize: 12.5 }]}>
+              {t('mode.current', {
+                what: mode === 'auto' ? t('mode.auto') : t('mode.manual') })}
+            </Text>
+            <Pill text={t('common.edit')} tone="soft" />
+          </View>
+        </Pressable>
+
         {/* ── 1. photo ─────────────────────────────────────────────────── */}
         <Section n={1} title={t('create.step.photo')} subtitle={t('create.photoSub')} state={st(0) === 'locked' ? 'active' : st(0)}>
           <Card style={{ padding: S.sm }}>
@@ -649,6 +831,25 @@ export default function Create({
         {/* ── 3. editable details ──────────────────────────────────────── */}
         {analysis ? (
           <Section n={3} title={t('create.step.info')} subtitle={t('create.infoSub')} state={st(2)}>
+            {/*
+              In manual mode nothing has been analysed, so the one-tap escape hatch is
+              offered up front: fill everything still empty, leave everything she has
+              typed exactly as it is.
+            */}
+            {mode === 'manual' ? (
+              <Card tone="indigo">
+                <View style={{ flexDirection: 'row', alignItems: 'center', gap: S.sm }}>
+                  <Spark size={17} />
+                  <Text style={[T.body, { flex: 1, fontFamily: 'Mukta_700Bold' }]}>
+                    {t('ai.continueFromHere')}
+                  </Text>
+                </View>
+                <Text style={T.bodySoft}>{t('ai.continueSub')}</Text>
+                <Btn label={t('ai.continueFromHere')} tone="indigo"
+                     busy={aiBusy === 'continue'} onPress={continueWithAi} />
+                <Text style={[T.micro, { fontSize: 11.5 }]}>{t('ai.editable')}</Text>
+              </Card>
+            ) : null}
             <Card>
               <Text style={T.label}>{t('create.speakOptional')}</Text>
               <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 6 }}>
@@ -690,15 +891,26 @@ export default function Create({
                    busy={busy === t('create.writing')} onPress={writeCopy} />
             </Card>
 
+            {/*
+              Every field carries its own AI button. This is what makes manual mode a
+              choice and not a lesser version of the app: the same models are here,
+              and she decides which field and when. Each suggestion is shown next to
+              what she already wrote and nothing is saved until she accepts it.
+            */}
             <Card>
-              <Field label={t('create.nameLocal')} value={titleHi} onChange={setTitleHi}
-                     placeholder={t('create.namePlaceholder')} />
-              <Field label="Name (English)" value={titleEn} onChange={setTitleEn}
-                     confidence={conf.title} placeholder="Product title" />
-              <Field label={t('create.descLocal')} value={descHi} onChange={setDescHi} multiline
-                     placeholder={t('create.descPlaceholder')} />
-              <Field label="Description (English)" value={descEn} onChange={setDescEn}
-                     multiline confidence={conf.description} />
+              <FieldWithAi label={t('create.nameLocal')} value={titleHi}
+                           onChange={setTitleHi} listingId={listingId} field="titleHi"
+                           placeholder={t('create.namePlaceholder')} />
+              <FieldWithAi label="Name (English)" value={titleEn} onChange={setTitleEn}
+                           listingId={listingId} field="title"
+                           confidence={conf.title} placeholder="Product title" />
+              <FieldWithAi label={t('create.descLocal')} value={descHi}
+                           onChange={setDescHi} multiline listingId={listingId}
+                           field="descriptionHi"
+                           placeholder={t('create.descPlaceholder')} />
+              <FieldWithAi label="Description (English)" value={descEn}
+                           onChange={setDescEn} multiline listingId={listingId}
+                           field="description" confidence={conf.description} />
               {descHi ? (
                 <Btn label={t('create.listenCheck')} tone="ghost"
                      icon={<Speaker color={C.ink} size={20} />}
@@ -1043,6 +1255,28 @@ export default function Create({
           setAuthOpen(false);
           // Return to precisely where they were and finish the action they asked for.
           doPublish();
+        }}
+      />
+
+      {/*
+        Asked on the first photograph, and reachable from the banner at the top after
+        that. The photograph she has already taken is held while she answers, so the
+        question never costs her a retake.
+      */}
+      <ModeSheet
+        visible={modeAsk}
+        onClose={() => setModeAsk(false)}
+        onChoose={(m) => {
+          setModeState(m);
+          const held = pendingPhoto.current;
+          pendingPhoto.current = null;
+          if (held) {
+            if (m === 'manual') attachOnly(held);
+            else connection.measure().then(async (r) => {
+              if (connection.useBackgroundJob(r)) await sendAsJob(held);
+              else await runAnalyze(held);
+            });
+          }
         }}
       />
     </View>

@@ -30,7 +30,21 @@ Base = declarative_base()
 
 
 def now() -> datetime:
-    return datetime.now(timezone.utc)
+    """
+    UTC, without a tzinfo.
+
+    Every timestamp in this database is naive UTC, and it has to stay that way. The
+    SQLite dialect silently strips the offset from an aware datetime on write, so the
+    rows are already naive; Postgres columns are `timestamp without time zone` and do
+    the same. Returning an aware value here would mean queries compare an aware bind
+    parameter against a naive column, which SQLite quietly tolerates and Postgres
+    resolves using the session time zone - a bug that only appears in production and
+    only for people not in UTC.
+
+    Anything read back is therefore naive UTC. Code comparing it against a timestamp
+    from a client attaches UTC first; see `_utc` in main.py.
+    """
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 def nid(prefix: str) -> str:

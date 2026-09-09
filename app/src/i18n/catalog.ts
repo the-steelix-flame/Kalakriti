@@ -557,6 +557,74 @@ export const EN = {
   'prof.clearCache': 'Clear saved copies',
   'prof.clearCacheNote': 'Removes the offline copies only. Nothing on the server is '
     + 'deleted.',
+
+  // ── how a listing gets made: auto or manual ────────────────────────────
+  'mode.title': 'How should we make your listing?',
+  'mode.sub': 'You can change this any time.',
+  'mode.auto': 'Let the AI do it',
+  'mode.autoSub': 'Take one photo. We do the rest and tell you when it is ready.',
+  'mode.autoDetail': 'Your photo is sent once. Everything happens on our computers, '
+    + 'so you can close the app, lose signal, or go back to work. The listing will be '
+    + 'waiting for you.',
+  'mode.manual': 'I will fill it in myself',
+  'mode.manualSub': 'You type it. Ask the AI for help on any part you want.',
+  'mode.manualDetail': 'Nothing is sent until you ask. Every part still has an AI '
+    + 'button, and you can say "carry on with AI from here" at any point.',
+  'mode.slowNotice': 'Your internet looks slow right now',
+  'mode.slowNoticeSub': 'Letting the AI do it on our computers means you only upload '
+    + 'the photo once.',
+  'mode.offlineNotice': 'No internet just now',
+  'mode.offlineNoticeSub': 'You can still write the whole listing. AI help will run '
+    + 'when the signal comes back.',
+  'mode.change': 'Change how listings are made',
+  'mode.current': 'Now: {what}',
+  'mode.recommended': 'Suggested for your connection',
+
+  // ── a listing being made on the server ─────────────────────────────────
+  'job.sent': 'Photo sent',
+  'job.sentSub': 'You can close the app. We will have it ready when you come back.',
+  'job.working': 'Making your listing',
+  'job.workingN': 'Making {n} listings',
+  'job.stage.queued': 'Waiting to start',
+  'job.stage.enhancing': 'Cleaning up the photo',
+  'job.stage.reading': 'Reading the label',
+  'job.stage.detecting': 'Looking at your product',
+  'job.stage.picture': 'Making the picture',
+  'job.stage.storing': 'Saving',
+  'job.stage.done': 'Ready',
+  'job.ready': 'Your listing is ready',
+  'job.readyN': '{n} listings are ready',
+  'job.readySub': 'Open it, check what we wrote, and change anything you like.',
+  'job.open': 'Open it',
+  'job.failed': 'That one did not work',
+  'job.failedSub': 'Nothing was lost. You can try the photo again.',
+  'job.retry': 'Try again',
+  'job.textFirst': 'Words first, pictures when the signal allows',
+  'job.imagePending': 'Picture will arrive when the signal is better',
+
+  // ── AI help on one field ───────────────────────────────────────────────
+  'ai.ai': 'AI',
+  'ai.fillWithAi': 'Fill this with AI',
+  'ai.suggestion': 'AI suggestion',
+  'ai.suggested': 'The AI suggests',
+  'ai.whatYouWrote': 'What you wrote',
+  'ai.thinking': 'Thinking…',
+  'ai.nothing': 'It could not suggest anything from what it has.',
+  'ai.useThis': 'Use this',
+  'ai.keepMine': 'Keep mine',
+  'ai.askAgain': 'Want it different?',
+  'ai.askAgainHint': 'e.g. mention the blue colour',
+  'ai.shorter': 'Shorter',
+  'ai.simpler': 'Simpler words',
+  'ai.moreDetail': 'More detail',
+  'ai.needsPhotoFirst': 'Add a photo first, so the AI has something to look at.',
+  'ai.notConfigured': 'AI help is not set up on this server yet.',
+  'ai.continueFromHere': 'Carry on with AI from here',
+  'ai.continueSub': 'Fill in everything still empty. Nothing you typed will change.',
+  'ai.continueDone': 'Suggestions ready. Nothing was saved — take what you want.',
+  'ai.accept': 'Use it',
+  'ai.acceptAll': 'Use all of these',
+  'ai.editable': 'You can change anything afterwards',
 } as const;
 
 export type StringKey = keyof typeof EN;
@@ -1078,4 +1146,72 @@ export const HI: Record<StringKey, string> = {
     + 'खुले और बिना इंटरनेट भी चले।',
   'prof.clearCache': 'सहेजी हुई नकलें हटाइए',
   'prof.clearCacheNote': 'सिर्फ़ ऑफ़लाइन नकलें हटेंगी। सर्वर से कुछ नहीं मिटता।',
+
+  // ── how a listing gets made: auto or manual ────────────────────────────
+  'mode.title': 'आपकी लिस्टिंग कैसे बनाएँ?',
+  'mode.sub': 'यह आप कभी भी बदल सकती हैं।',
+  'mode.auto': 'AI को करने दीजिए',
+  'mode.autoSub': 'एक फोटो लीजिए। बाकी हम करेंगे और तैयार होने पर बता देंगे।',
+  'mode.autoDetail': 'आपका फोटो एक ही बार जाता है। सारा काम हमारे कंप्यूटर पर होता है, '
+    + 'इसलिए आप ऐप बंद कर सकती हैं, नेटवर्क चला जाए तब भी चलेगा। लिस्टिंग आपका '
+    + 'इंतज़ार करती मिलेगी।',
+  'mode.manual': 'मैं खुद भरूँगी',
+  'mode.manualSub': 'आप लिखिए। जहाँ चाहें वहाँ AI से मदद ले लीजिए।',
+  'mode.manualDetail': 'जब तक आप न कहें, कुछ नहीं भेजा जाता। हर हिस्से पर AI का बटन है, '
+    + 'और आप कभी भी "यहाँ से आगे AI करे" कह सकती हैं।',
+  'mode.slowNotice': 'अभी आपका इंटरनेट धीमा लग रहा है',
+  'mode.slowNoticeSub': 'AI को हमारे कंप्यूटर पर करने दें तो फोटो सिर्फ़ एक बार '
+    + 'भेजना पड़ेगा।',
+  'mode.offlineNotice': 'अभी इंटरनेट नहीं है',
+  'mode.offlineNoticeSub': 'आप पूरी लिस्टिंग अभी भी लिख सकती हैं। नेटवर्क आते ही AI '
+    + 'की मदद चल जाएगी।',
+  'mode.change': 'लिस्टिंग बनाने का तरीका बदलिए',
+  'mode.current': 'अभी: {what}',
+  'mode.recommended': 'आपके नेटवर्क के लिए सुझाव',
+
+  // ── a listing being made on the server ─────────────────────────────────
+  'job.sent': 'फोटो भेज दिया',
+  'job.sentSub': 'आप ऐप बंद कर सकती हैं। लौटने पर तैयार मिलेगा।',
+  'job.working': 'आपकी लिस्टिंग बन रही है',
+  'job.workingN': '{n} लिस्टिंग बन रही हैं',
+  'job.stage.queued': 'शुरू होने का इंतज़ार',
+  'job.stage.enhancing': 'फोटो साफ़ किया जा रहा है',
+  'job.stage.reading': 'लेबल पढ़ा जा रहा है',
+  'job.stage.detecting': 'आपका सामान देखा जा रहा है',
+  'job.stage.picture': 'तस्वीर बनाई जा रही है',
+  'job.stage.storing': 'सहेजा जा रहा है',
+  'job.stage.done': 'तैयार',
+  'job.ready': 'आपकी लिस्टिंग तैयार है',
+  'job.readyN': '{n} लिस्टिंग तैयार हैं',
+  'job.readySub': 'खोलिए, हमने जो लिखा है देखिए, और जो चाहें बदल दीजिए।',
+  'job.open': 'खोलिए',
+  'job.failed': 'यह वाला नहीं बन पाया',
+  'job.failedSub': 'कुछ खोया नहीं है। आप फोटो फिर से भेज सकती हैं।',
+  'job.retry': 'फिर कोशिश कीजिए',
+  'job.textFirst': 'पहले शब्द, तस्वीरें नेटवर्क आने पर',
+  'job.imagePending': 'नेटवर्क ठीक होने पर तस्वीर आ जाएगी',
+
+  // ── AI help on one field ───────────────────────────────────────────────
+  'ai.ai': 'AI',
+  'ai.fillWithAi': 'इसे AI से भरवाइए',
+  'ai.suggestion': 'AI का सुझाव',
+  'ai.suggested': 'AI यह कहता है',
+  'ai.whatYouWrote': 'आपने जो लिखा',
+  'ai.thinking': 'सोच रहा है…',
+  'ai.nothing': 'जो जानकारी है उससे कुछ सुझा नहीं पाया।',
+  'ai.useThis': 'यही रखिए',
+  'ai.keepMine': 'मेरा वाला रहने दीजिए',
+  'ai.askAgain': 'कुछ और चाहिए?',
+  'ai.askAgainHint': 'जैसे, नीले रंग का ज़िक्र कीजिए',
+  'ai.shorter': 'छोटा',
+  'ai.simpler': 'आसान शब्द',
+  'ai.moreDetail': 'ज़्यादा जानकारी',
+  'ai.needsPhotoFirst': 'पहले फोटो जोड़िए, ताकि AI कुछ देख सके।',
+  'ai.notConfigured': 'इस सर्वर पर अभी AI मदद चालू नहीं है।',
+  'ai.continueFromHere': 'यहाँ से आगे AI करे',
+  'ai.continueSub': 'जो खाली है वह भर देगा। आपका लिखा कुछ नहीं बदलेगा।',
+  'ai.continueDone': 'सुझाव तैयार हैं। कुछ सहेजा नहीं गया — जो चाहें ले लीजिए।',
+  'ai.accept': 'ले लीजिए',
+  'ai.acceptAll': 'ये सब ले लीजिए',
+  'ai.editable': 'बाद में आप कुछ भी बदल सकती हैं',
 };

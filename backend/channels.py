@@ -363,13 +363,25 @@ def _metric(value=None, source=""):
     return {"value": value, "available": True, "why": "", "source": source}
 
 
-def _none(why: str):
-    return {"value": None, "available": False, "why": why, "source": ""}
+def _none(why: str, config: str = ""):
+    """
+    An absent metric.
+
+    `why` is written for the artisan and says what she can understand: this platform
+    does not share this number. `config` carries the exact environment variables an
+    operator has to set, kept separate so a seller is not shown AMZN_LWA_CLIENT_ID as
+    though it were an explanation. The brief asks for both, and they are not the same
+    audience.
+    """
+    return {"value": None, "available": False, "why": why, "config": config,
+            "source": ""}
 
 
 def _all_unconfigured(name: str, missing: list[str]) -> dict[str, Any]:
-    why = f"{name} is not connected. Set {', '.join(missing)} to fetch real figures."
-    return {k: _none(why) for k in METRICS}
+    why = (f"{name} is not connected to this app yet, so it cannot report anything. "
+           f"Nothing is wrong with your product.")
+    config = ("Set " + ", ".join(missing)) if missing else ""
+    return {k: _none(why, config) for k in METRICS}
 
 
 def _amazon_token() -> str:

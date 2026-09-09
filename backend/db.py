@@ -1,5 +1,11 @@
 """
-Persistence. SQLite via SQLAlchemy - a real database, on disk, surviving restarts.
+Persistence via SQLAlchemy - a real database, surviving restarts.
+
+The deployment target is a hosted Postgres (Neon, Supabase or Render), named by
+DATABASE_URL. SQLite is the fallback so the project still runs from a clean checkout
+with nothing configured, but it is only a development convenience: on a hosted
+container the SQLite file sits on an ephemeral disk and every artisan, listing and
+order disappears at the next deploy.
 
 Listings, publication attempts, orders, shipments, sessions and their status
 transitions are all rows, which is what makes status tracking and the order
@@ -11,22 +17,173 @@ what the platform actually replied with.
 """
 from __future__ import annotations
 
+import logging
 import os
+import time
 import uuid
 from datetime import datetime, timezone
 
 from sqlalchemy import (
     JSON, Column, DateTime, Float, ForeignKey, Integer, String, Text, create_engine,
+    text,
 )
+from sqlalchemy.dialects import postgresql
+from sqlalchemy.engine import make_url
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import declarative_base, relationship, sessionmaker
 
-DB_URL = os.getenv("DATABASE_URL", "sqlite:///./kalakriti.db")
-engine = create_engine(
-    DB_URL,
-    connect_args={"check_same_thread": False} if DB_URL.startswith("sqlite") else {},
-)
+log = logging.getLogger("db")
+
+
+def _env(name: str, default: str) -> str:
+    """
+    Read an environment variable, treating a blank value as if it were unset.
+
+    `os.getenv(name, default)` returns the default only when the variable is absent.
+    An empty string is present, so it wins - and .env ships every variable as a blank
+    placeholder for the user to paste a value next to, which means `DATABASE_URL=`
+    silently becomes the connection URL. SQLAlchemy is then handed "" and the whole
+    application fails at import, on a line that reads as obviously correct.
+
+    Blank means "not configured yet" and falls back. A non-empty value that happens to
+    be wrong is a different thing entirely and is still allowed to fail loudly, because
+    someone who typed a URL needs to be told it is broken rather than quietly ignored.
+    """
+    value = os.getenv(name)
+    return default if value is None or not value.strip() else value.strip()
+
+
+RAW_DB_URL = _env("DATABASE_URL", "sqlite:///./kalakriti.db")
+
+# How long a connection attempt may hang before it is abandoned. Without this a wrong
+# host makes the TCP connect wait for the operating system's default timeout, which on
+# Linux is around two minutes: the container looks hung at startup and the platform
+# kills it before any error is logged.
+CONNECT_TIMEOUT_S = int(_env("DB_CONNECT_TIMEOUT", "10"))
+
+
+def _normalise_url(raw: str) -> str:
+    """
+    Turn whatever a hosting provider handed out into a URL SQLAlchemy 2.x accepts.
+
+    Neon, Supabase, Render and Heroku all print connection strings beginning with
+    `postgres://`. SQLAlchemy 2.x removed that alias and raises `NoSuchModuleError`
+    for it, so the deploy fails on a purely cosmetic difference. Both `postgres://`
+    and `postgresql://` are rewritten to name a driver explicitly, because leaving
+    the driver unspecified makes SQLAlchemy reach for psycopg2, which is not what
+    this project installs (requirements.txt pins psycopg 3).
+
+    An explicit driver the caller already chose - `postgresql+psycopg2://`, say - is
+    left alone.
+    """
+    raw = (raw or "").strip()
+    if raw.startswith("postgres://"):
+        raw = "postgresql://" + raw[len("postgres://"):]
+    if raw.startswith("postgresql://"):
+        raw = "postgresql+" + _pg_driver() + "://" + raw[len("postgresql://"):]
+    return raw
+
+
+def _pg_driver() -> str:
+    """
+    Prefer psycopg 3, fall back to psycopg2 if that is what is actually installed.
+
+    Naming a driver that is absent produces `ModuleNotFoundError: No module named
+    'psycopg'` from deep inside the dialect loader, which reads like a bug in the app
+    rather than a missing dependency. Choosing the one that imports keeps the failure
+    honest on machines where only the older driver is present.
+    """
+    try:
+        import psycopg  # noqa: F401
+        return "psycopg"
+    except ImportError:
+        try:
+            import psycopg2  # noqa: F401
+            return "psycopg2"
+        except ImportError:
+            # Neither is installed. Name psycopg anyway so the resulting error points
+            # at the dependency this project declares.
+            return "psycopg"
+
+
+DB_URL = _normalise_url(RAW_DB_URL)
+IS_SQLITE = DB_URL.startswith("sqlite")
+
+
+def safe_url() -> str:
+    """The connection URL with the password removed, for logs and health output."""
+    try:
+        return make_url(DB_URL).render_as_string(hide_password=True)
+    except Exception:
+        # Unparseable, so there is no password field to hide. Anything before an "@"
+        # is dropped anyway, because a URL malformed enough to fail parsing can still
+        # contain real credentials and this string is going into a log.
+        shown = DB_URL.split("@")[-1] if "@" in DB_URL else DB_URL
+        return f"<unparseable: ...{shown}>"
+
+
+def _engine_kwargs() -> dict:
+    if IS_SQLITE:
+        # SQLite is the local-development fallback. The one thing it needs is
+        # permission to be used from more than one thread, because FastAPI serves
+        # requests on a thread pool and the background job workers have their own.
+        return {"connect_args": {"check_same_thread": False}}
+
+    return {
+        # The single most important setting for a hosted Postgres. Neon and Supabase
+        # close idle connections, and a scale-to-zero instance drops every one of them
+        # when it suspends. A pooled connection that has been sitting since before
+        # that is dead, and the next query on it raises OperationalError - which the
+        # artisan sees as a random 500 on whatever screen she happened to open first
+        # after lunch. pre_ping spends one cheap round trip verifying the connection
+        # and transparently replaces it if it has gone.
+        "pool_pre_ping": True,
+
+        # Discard connections before anything upstream does it for us. Supabase's
+        # pooler and most cloud load balancers cut idle connections at five minutes;
+        # 280 seconds keeps us inside that window, so recycling is our decision rather
+        # than a surprise mid-query reset.
+        "pool_recycle": 280,
+
+        # Sized for one uvicorn worker on a small container. Hosted Postgres plans
+        # cap total connections aggressively - Neon's free tier and Supabase's pooler
+        # both count them - so a large pool per container is how a two-instance deploy
+        # locks itself out of its own database.
+        "pool_size": 5,
+        "max_overflow": 10,
+        "pool_timeout": 30,
+
+        "connect_args": {
+            "connect_timeout": CONNECT_TIMEOUT_S,
+            # Shows up in pg_stat_activity, which is the only way to tell this app's
+            # connections apart from a migration script's when the pool fills up.
+            "application_name": _env("APP_NAME", "kalakriti"),
+        },
+    }
+
+
+try:
+    engine = create_engine(DB_URL, **_engine_kwargs())
+except Exception as exc:  # pragma: no cover - configuration failure, not logic
+    # create_engine does not connect, but it does load the dialect and its driver, so
+    # this is where a missing psycopg or a malformed URL surfaces. Left as a raw
+    # traceback it looks like an import bug somewhere in SQLAlchemy; naming DATABASE_URL
+    # points at the thing that actually needs changing.
+    hint = ("\nInstall the Postgres driver with: pip install 'psycopg[binary]'"
+            if isinstance(exc, ImportError) or "no module named" in str(exc).lower()
+            else "")
+    raise RuntimeError(
+        f"Cannot configure the database from DATABASE_URL={safe_url()}: {exc}.{hint}"
+    ) from exc
 SessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
 Base = declarative_base()
+
+# JSONB on Postgres, plain JSON everywhere else. JSONB is stored parsed rather than as
+# text, so it can be indexed and queried by key; plain JSON on Postgres is a string
+# column that happens to be validated on write. Python-facing behaviour is identical -
+# dicts and lists in, dicts and lists out - so nothing else in the codebase changes.
+# On SQLite the variant is ignored and this stays the ordinary JSON type.
+JSONType = JSON().with_variant(postgresql.JSONB, "postgresql")
 
 
 def now() -> datetime:
@@ -199,7 +356,7 @@ class MarketplaceAccount(Base):
     channel = Column(String)
     external_seller_id = Column(String, default="")
     status = Column(String, default="not_started")
-    fields = Column(JSON, default=dict)
+    fields = Column(JSONType, default=dict)
     last_error = Column(Text, default="")
     updated_at = Column(DateTime, default=now, onupdate=now)
 
@@ -235,16 +392,16 @@ class Listing(Base):
     breadth_cm = Column(Integer, default=15)
     height_cm = Column(Integer, default=10)
 
-    attributes = Column(JSON, default=dict)
-    tags = Column(JSON, default=list)
+    attributes = Column(JSONType, default=dict)
+    tags = Column(JSONType, default=list)
     image_url = Column(String, default="")
     raw_hash = Column(String, default="")
-    enhance_ops = Column(JSON, default=list)
+    enhance_ops = Column(JSONType, default=list)
 
-    vision = Column(JSON, default=dict)
-    ocr = Column(JSON, default=dict)
+    vision = Column(JSONType, default=dict)
+    ocr = Column(JSONType, default=dict)
     transcript = Column(Text, default="")
-    channels_selected = Column(JSON, default=list)
+    channels_selected = Column(JSONType, default=list)
 
     status = Column(String, default="draft")
     created_at = Column(DateTime, default=now)
@@ -286,8 +443,8 @@ class Publication(Base):
     external_id = Column(String, default="")
     url = Column(String, default="")
     error = Column(Text, default="")
-    request = Column(JSON, default=dict)
-    response = Column(JSON, default=dict)
+    request = Column(JSONType, default=dict)
+    response = Column(JSONType, default=dict)
     submitted_at = Column(DateTime, default=now)
     updated_at = Column(DateTime, default=now, onupdate=now)
 
@@ -374,7 +531,7 @@ class Shipment(Base):
     pickup_scheduled_at = Column(DateTime, nullable=True)
     status = Column(String, default="pending")
     last_error = Column(Text, default="")
-    raw = Column(JSON, default=dict)
+    raw = Column(JSONType, default=dict)
     created_at = Column(DateTime, default=now)
     updated_at = Column(DateTime, default=now, onupdate=now)
 
@@ -402,7 +559,7 @@ class Event(Base):
     frm = Column(String, default="")
     to = Column(String, default="")
     detail = Column(Text, default="")
-    payload = Column(JSON, default=dict)
+    payload = Column(JSONType, default=dict)
     at = Column(DateTime, default=now)
 
     def public(self) -> dict:
@@ -489,8 +646,114 @@ ENQUIRY_FLOW = ["new", "replied", "quoted", "won"]
 ENQUIRY_TERMINAL = ["lost"]
 
 
-def init() -> None:
-    Base.metadata.create_all(engine)
+def _diagnose(exc: BaseException) -> str:
+    """
+    Turn a driver exception into the one sentence that says what to fix.
+
+    A failed startup normally logs a traceback ending in `OperationalError`, whose
+    text is a wall of libpq detail. Whoever is deploying at the time needs to know
+    which of four different mistakes they made, so the categories are matched on the
+    message the driver actually produces.
+    """
+    msg = str(exc).lower()
+    if "password authentication failed" in msg or ("role" in msg and "does not exist" in msg):
+        return "the database rejected the username or password in DATABASE_URL"
+    if "database" in msg and "does not exist" in msg:
+        return "the database named in DATABASE_URL does not exist on that server"
+    if ("could not translate host name" in msg or "name or service not known" in msg
+            or "nodename nor servname" in msg or "getaddrinfo" in msg):
+        return "the host in DATABASE_URL does not resolve - check the hostname"
+    if "connection refused" in msg or "could not connect to server" in msg:
+        return ("nothing is listening at that host and port - check the port, and "
+                "whether the database is paused")
+    if "timeout" in msg or "timed out" in msg:
+        return (f"the connection timed out after {CONNECT_TIMEOUT_S}s - the host may be "
+                "unreachable from here, or blocked by an IP allow-list")
+    if "ssl" in msg:
+        return "the TLS handshake failed - hosted Postgres usually needs ?sslmode=require"
+    if "no such module" in msg or "modulenotfounderror" in msg or "can't load plugin" in msg:
+        return "the Postgres driver is not installed - pip install 'psycopg[binary]'"
+    return "the database could not be reached"
+
+
+def init(attempts: int = 4) -> None:
+    """
+    Create any missing tables, retrying while the database wakes up.
+
+    A serverless Postgres that has scaled to zero takes a few seconds to resume, and
+    the first connection during that window fails outright. If startup gives up on
+    that first failure the container exits, the platform restarts it, and it fails
+    again for exactly as long as the database is cold - so the deploy looks broken
+    when nothing is wrong. Backing off and trying again costs a few seconds and
+    removes that whole failure mode.
+
+    Retrying cannot fix a wrong password or a bad hostname, so on final failure this
+    raises with the specific problem named rather than the raw driver traceback.
+    """
+    delay = 1.0
+    last: BaseException | None = None
+    for attempt in range(1, max(1, attempts) + 1):
+        try:
+            Base.metadata.create_all(engine)
+            if attempt > 1:
+                log.info("database ready after %d attempts", attempt)
+            return
+        except (SQLAlchemyError, OSError) as exc:
+            last = exc
+            if attempt >= attempts:
+                break
+            log.warning("database not ready (attempt %d/%d): %s", attempt, attempts, exc)
+            time.sleep(delay)
+            delay *= 2
+
+    raise RuntimeError(
+        f"Cannot initialise the database at {safe_url()}: {_diagnose(last)}. "
+        f"Underlying error: {last}"
+    ) from last
+
+
+def health() -> dict:
+    """
+    What this process can actually see of its database, right now.
+
+    Deliberately never raises. It is meant to be called from a health endpoint, where
+    an exception would turn a report of a broken database into a broken report - the
+    caller gets `ok: False` and the error text instead.
+    """
+    out: dict = {
+        "engine": engine.name,
+        "url": safe_url(),
+        "ok": False,
+        "latencyMs": None,
+        "pool": {},
+        "error": None,
+    }
+    started = time.perf_counter()
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1")).scalar()
+        out["ok"] = True
+        out["latencyMs"] = round((time.perf_counter() - started) * 1000, 1)
+    except Exception as exc:
+        # Latency is still recorded on failure: a timeout at the full connect timeout
+        # tells a different story from an instant refusal.
+        out["latencyMs"] = round((time.perf_counter() - started) * 1000, 1)
+        out["error"] = f"{_diagnose(exc)}: {exc}"
+
+    # Pool counters exist on QueuePool but not on every pool implementation, so each
+    # one is read defensively rather than assumed.
+    try:
+        pool = engine.pool
+        for key, attr in (("size", "size"), ("checkedIn", "checkedin"),
+                          ("checkedOut", "checkedout"), ("overflow", "overflow")):
+            fn = getattr(pool, attr, None)
+            if callable(fn):
+                out["pool"][key] = fn()
+        out["pool"]["class"] = type(pool).__name__
+    except Exception as exc:
+        out["pool"] = {"error": str(exc)}
+
+    return out
 
 
 def session():

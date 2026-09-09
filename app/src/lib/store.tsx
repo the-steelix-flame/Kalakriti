@@ -26,7 +26,7 @@ import * as api from './api';
 import * as cache from './cache';
 import * as session from './session';
 import * as sync from './sync';
-import { hasBackend } from './config';
+import { hasBackend, resolve as resolveBackend } from './config';
 
 type Ctx = {
   ready: boolean;                     // session hydrated; safe to decide onboarding
@@ -97,6 +97,8 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   const [lastSync, setLastSync] = useState<number | null>(null);
 
   const inflight = useRef(false);
+  /** Set below, so boot can trigger a refresh once a backend is chosen. */
+  const refreshRef = useRef<((o?: { silent?: boolean }) => Promise<void>) | null>(null);
 
   /* ------------------------------------------------------------ boot */
 
@@ -104,6 +106,14 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     (async () => {
       await session.hydrate();
       await sync.load();
+
+      // Settle on a backend, but never block the first screen on it. With one
+      // candidate this is instant; with a hosted URL and a LAN fallback each probe
+      // costs up to four seconds, so waiting for both would mean an artisan with no
+      // signal stares at a spinner for eight seconds before the app admits it is
+      // offline. Cached data renders regardless, and the first refresh picks up
+      // whichever backend answered.
+      void resolveBackend().then(() => refreshRef.current?.({ silent: true }));
       setPending(sync.pending());
       setConflicts(await sync.conflicts());
 
@@ -255,6 +265,8 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     const id = setInterval(() => { refreshJobs(); }, 15000);
     return () => clearInterval(id);
   }, [ready, jobsWorking, refreshJobs]);
+
+  useEffect(() => { refreshRef.current = refresh; }, [refresh]);
 
   const refreshOrders = useCallback(async () => {
     try {

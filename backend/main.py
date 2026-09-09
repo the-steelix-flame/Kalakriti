@@ -74,23 +74,27 @@ if _orphans:
 
 def _db_kind() -> dict:
     """
-    Which database this process is actually talking to.
+    Which database this process is actually talking to, and whether it answers.
 
-    Worth surfacing: SQLite on a hosted container is a file on an ephemeral disk, so
-    every artisan, listing and order vanishes on the next deploy. That failure is
-    silent until somebody notices their account is gone, so it is reported here.
+    Delegates to db.health(), which runs a real SELECT 1 rather than inferring from
+    the URL - the interesting failure is a DATABASE_URL that is set and correct-looking
+    but unreachable, and a string comparison cannot see that.
+
+    The warning is the point of this endpoint. SQLite on a hosted container sits on an
+    ephemeral disk: every artisan, listing and order is lost on the next deploy, and
+    nothing announces it. Somebody discovers it when a seller cannot log in.
     """
-    url = os.getenv("DATABASE_URL", "sqlite:///./kalakriti.db")
-    kind = url.split(":", 1)[0].split("+", 1)[0]
+    h = db.health()
     hosted = bool(os.getenv("RENDER") or os.getenv("FLY_APP_NAME")
                   or os.getenv("RAILWAY_ENVIRONMENT"))
-    return {
-        "engine": kind,
-        "warning": ("SQLite on a hosted container sits on an ephemeral disk. Every "
-                    "account, listing and order is lost on the next deploy. Set "
-                    "DATABASE_URL to a Postgres connection string.")
-        if kind == "sqlite" and hosted else "",
-    }
+    warning = ""
+    if h.get("engine") == "sqlite" and hosted:
+        warning = ("SQLite on a hosted container sits on an ephemeral disk. Every "
+                   "account, listing and order is lost on the next deploy. Set "
+                   "DATABASE_URL to a Postgres connection string.")
+    elif not h.get("ok"):
+        warning = f"The database did not answer: {h.get('error', 'unknown error')}"
+    return {**h, "warning": warning}
 
 
 def _b64(raw: str) -> bytes:

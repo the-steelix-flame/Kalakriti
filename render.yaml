@@ -1,12 +1,19 @@
-# Render blueprint: a public HTTPS backend and a managed Postgres, from one file.
+# Render blueprint: a public HTTPS backend, and optionally a managed Postgres,
+# from one file.
 #
 # `render blueprint launch`, or point Render at this repository.
 #
 # Read the plan lines before deploying. The free web-service tier gives 512 MB of
-# RAM; onnxruntime plus the U^2-Net weights need roughly 700 MB resident, so the
-# free instance will be OOM-killed on the first photograph. `starter` is the
-# smallest plan this actually runs on. The alternative, if the budget is genuinely
-# zero, is HEAVY_VISION=0 - see the note below.
+# RAM; onnxruntime plus the U^2-Net weights plus RapidOCR need roughly 700 MB
+# resident, so a free instance is OOM-killed on the first photograph and the symptom
+# is a restart loop rather than an error. `starter` is the smallest plan this
+# actually runs on. There is no environment variable that turns the local models off
+# - that would be a code change, not a setting - so the memory line below is not
+# optional.
+#
+# After deploying, run `python preflight.py --production` with these same values in
+# the environment. It checks rather than assumes: it connects to the database, writes
+# and reads back a test object in the bucket, and calls the model endpoint.
 services:
   - type: web
     name: kalakriti-api
@@ -17,20 +24,42 @@ services:
     envVars:
       - key: NVIDIA_API_KEY
         sync: false                    # set in the dashboard; never in the repo
+
+      # Managed Postgres from the `databases:` block at the bottom of this file.
+      #
+      # To use Neon or Supabase instead - which is what the free path in
+      # docs/DEPLOY.md does - delete these three lines, replace them with
+      # `sync: false`, and paste the connection string in the dashboard. Then delete
+      # the `databases:` block too, or Render will bill for a database nothing uses.
       - key: DATABASE_URL
         fromDatabase:
           name: kalakriti-db
           property: connectionString
+
+      # Deliberately not `fromService: property: host`. That property yields a bare
+      # hostname with no scheme - `kalakriti-api.onrender.com` - and this value is
+      # concatenated directly into listing URLs, storefront links, webhook targets
+      # and locally served image paths. A URL with no scheme is not a URL, and every
+      # link built from it is broken.
+      #
+      # So it is set by hand, once, after the first deploy: copy the https:// address
+      # shown at the top of the service page in the Render dashboard. Until then
+      # preflight reports it as the failure it is.
       - key: PUBLIC_BASE_URL
-        fromService:
-          type: web
-          name: kalakriti-api
-          property: host
+        sync: false
+
+      # Sessions are signed with the first. The second salts the hash that keeps a
+      # storefront view row from identifying the person who made it. Both must be set
+      # here rather than left to the code's fallbacks: auth.py otherwise writes a
+      # generated key to jwt_secret.txt, which lives on the container filesystem and
+      # is therefore replaced on every deploy, silently logging every artisan out.
       - key: JWT_SECRET
         generateValue: true
       - key: VIEW_SALT
         generateValue: true
-      # Images must not live on the container disk: it is wiped on every deploy.
+
+      # Images must not live on the container disk: it is wiped on every deploy, and
+      # a marketplace has already published the image URL by then.
       - key: MEDIA_S3_ENDPOINT
         sync: false
       - key: MEDIA_S3_BUCKET
@@ -39,15 +68,31 @@ services:
         sync: false
       - key: MEDIA_S3_SECRET
         sync: false
+      # The bucket's public read URL. Without it, image URLs are built from the S3
+      # API endpoint, which requires a signature - on R2 an unsigned browser request
+      # gets 401, so every product photograph is a broken image to a buyer.
       - key: MEDIA_PUBLIC_BASE
         sync: false
+      # Not a secret. R2 wants the literal string `auto`; real AWS wants a region
+      # name such as ap-south-1.
+      - key: MEDIA_S3_REGION
+        value: auto
+
       # OTP delivery. Without these the server refuses to send a code rather than
-      # pretending to; OTP_DEV_ECHO must never be set here.
+      # pretending to, which means nobody can log in. OTP_DEV_ECHO is deliberately
+      # absent and must stay absent: it returns the login code in the API response,
+      # so setting it here would hand anybody who can call the endpoint a login for
+      # any phone number.
       - key: MSG91_AUTH_KEY
         sync: false
       - key: MSG91_TEMPLATE_ID
         sync: false
 
+# Delete this block if DATABASE_URL points at Neon or Supabase.
+#
+# `basic-256mb` is a paid plan, chosen because Render's free Postgres instance is
+# deleted after 30 days and takes the data with it. If the budget is genuinely zero,
+# the free path in docs/DEPLOY.md uses Neon, whose free tier does not expire.
 databases:
   - name: kalakriti-db
     plan: basic-256mb

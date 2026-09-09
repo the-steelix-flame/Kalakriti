@@ -32,7 +32,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import Column, DateTime, Integer, String, Text, JSON
+from sqlalchemy import Column, DateTime, Integer, String, Text
 
 import db
 
@@ -59,8 +59,10 @@ class Job(db.Base):
     stage = Column(String, default="queued")
     progress = Column(Integer, default=0)         # 0-100, for a progress bar
 
-    payload = Column(JSON, default=dict)          # inputs, minus the image bytes
-    result = Column(JSON, default=dict)           # the cheap fields, delivered first
+    # db.JSONType is JSONB on Postgres and plain JSON on SQLite. Plain JSON on
+    # Postgres is stored as text and reparsed on every read.
+    payload = Column(db.JSONType, default=dict)          # inputs, minus the image bytes
+    result = Column(db.JSONType, default=dict)           # the cheap fields, delivered first
     error = Column(Text, default="")
 
     # The upload, held only until the job finishes. Kept out of `payload` so a status

@@ -204,6 +204,24 @@ def now() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
+def naive_utc(dt: datetime | None) -> datetime | None:
+    """
+    Coerce any datetime to the form every column in this schema uses: naive UTC.
+
+    Needed because a value's shape depends on where it came from. A row just written
+    in this process still holds whatever Python object was assigned; the same row read
+    back from SQLite is naive; Postgres with a timestamptz column would hand back an
+    aware one. Comparing across those raises TypeError, and it raises at the moment a
+    token is checked rather than when it is written - so the failure surfaces as a 500
+    on login rather than anywhere near the cause.
+    """
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt
+    return dt.astimezone(timezone.utc).replace(tzinfo=None)
+
+
 def nid(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex[:12]}"
 

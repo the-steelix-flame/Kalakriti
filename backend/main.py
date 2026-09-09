@@ -554,13 +554,13 @@ def patch_listing(lid: str, body: ListingPatch,
              "floorPrice": "floor_price", "quantity": "quantity", "tags": "tags",
              "attributes": "attributes", "transcript": "transcript"}
 
-        # SQLite hands back naive datetimes, and the client echoes whatever it was
-        # given, so both sides are normalised to UTC before they are compared. The one
-        # second of slack absorbs the sub-second difference between the value the
-        # client read and the value the database rounded on write; without it every
-        # edit would look stale against itself.
-        def _utc(dt):
-            return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt
+        # Every timestamp in this database is naive UTC (see db.now), and the client
+        # echoes back whatever it was given, which carries an offset. Both sides go
+        # through db.naive_utc so the comparison is like for like. The one second of
+        # slack absorbs the sub-second difference between the value the client read
+        # and the value the database rounded on write; without it every edit would
+        # look stale against itself.
+        _utc = db.naive_utc
 
         # Which fields somebody else changed after the version this edit was made
         # against. The event log already records every edit as "edited: a, b", so it

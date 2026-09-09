@@ -75,8 +75,7 @@ def request_otp(s, phone_raw: str) -> dict:
               .filter(db.OtpChallenge.phone == phone)
               .order_by(db.OtpChallenge.created_at.desc()).first())
     if recent and recent.created_at:
-        created = recent.created_at.replace(tzinfo=timezone.utc) \
-            if recent.created_at.tzinfo is None else recent.created_at
+        created = db.naive_utc(recent.created_at)
         age = (db.now() - created).total_seconds()
         if age < OTP_RESEND_COOLDOWN and not recent.consumed:
             return {"ok": False, "error": "cooldown",
@@ -133,8 +132,7 @@ def verify_otp(s, challenge_id: str, code: str, user_agent: str = "",
         return {"ok": False, "error": "already_used",
                 "message": "This code was already used. Please request a new one."}
 
-    exp = ch.expires_at.replace(tzinfo=timezone.utc) \
-        if ch.expires_at and ch.expires_at.tzinfo is None else ch.expires_at
+    exp = db.naive_utc(ch.expires_at)
     if not exp or db.now() > exp:
         return {"ok": False, "error": "expired",
                 "message": "The code has expired. Please request a new one."}
@@ -187,8 +185,7 @@ def verify_otp(s, challenge_id: str, code: str, user_agent: str = "",
 # ───────────────────────────────────────────────────────────────────── tokens
 
 def issue_token(sess: db.Session) -> str:
-    exp = sess.expires_at.replace(tzinfo=timezone.utc) \
-        if sess.expires_at.tzinfo is None else sess.expires_at
+    exp = db.naive_utc(sess.expires_at)
     return jwt.encode(
         {"sid": sess.id, "aid": sess.artisan_id, "exp": int(exp.timestamp())},
         _secret(), algorithm=JWT_ALG)
@@ -206,8 +203,7 @@ def artisan_from_token(s, token: str | None) -> db.Artisan | None:
     sess = s.get(db.Session, claims.get("sid", ""))
     if not sess or sess.revoked:
         return None
-    exp = sess.expires_at.replace(tzinfo=timezone.utc) \
-        if sess.expires_at and sess.expires_at.tzinfo is None else sess.expires_at
+    exp = db.naive_utc(sess.expires_at)
     if not exp or db.now() > exp:
         return None
     return s.get(db.Artisan, sess.artisan_id)

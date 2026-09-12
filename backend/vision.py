@@ -38,6 +38,26 @@ from PIL import Image
 
 import llm
 
+# Which model looks at the photograph. This is the slowest step in the app by a wide
+# margin, so the alternatives were measured rather than assumed. Same drawn test image,
+# same laptop, so none of these numbers include the hosting:
+#
+#   meta/llama-3.2-11b-vision-instruct            63-70s over 4 runs, mean 65   (kept)
+#   nvidia/nemotron-3-nano-omni-30b-a3b-reasoning 77s on 1 run, object correct
+#   meta/llama-3.2-90b-vision-instruct            907s, then HTTP 504. Unusable.
+#
+# Everything else multimodal on the account - gemma-3, phi-3-vision, vila, kosmos-2,
+# neva-22b, cosmos-reason2 - returns 404 on this endpoint, whatever models.list says.
+#
+# So there is no faster option available and the 11b model stays. The latency is
+# queueing at NVIDIA, not size: the same model and image has come back in 10 seconds
+# and in 169. Shrinking the image to a single 560px tile made it slower, not faster,
+# which is how we know it is not image tokens.
+#
+# The omni model is worth a second look if detection quality ever matters more than
+# these 12 seconds: it returned a full 12 fields on its one run, where the 11b model
+# gave a usable object on only 2 of 4. That is one sample against four, so it is a
+# lead and not a finding.
 VLM_MODEL = os.getenv("NVIDIA_VLM_MODEL", "meta/llama-3.2-11b-vision-instruct")
 
 # Below this, a field is offered as a suggestion but never auto-filled.

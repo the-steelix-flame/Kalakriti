@@ -57,6 +57,60 @@ LOCAL_VISION = (os.getenv("LOCAL_VISION") or "on").strip().lower() not in (
     "off", "0", "false", "no")
 
 
+# Longest edge the whole pipeline works at, before anything looks at the photograph.
+#
+# This is the cap that matters, and it was missing. MATTE_MAX_PX below only protected
+# the matting step; everything else - the vision call, `enhance`, and the full
+# resolution copy saved as the original - still handled the photograph at whatever the
+# camera produced.
+#
+# A current phone shoots 3072x4080. As a PIL RGB image that is 37 MB, and `enhance`
+# holds several of them at once: the decode, the auto-levels result, and a copy per
+# ImageEnhance pass. Saving the original re-decodes it again. On a 512 MB container
+# that is an out-of-memory kill in the middle of the request, and the symptom is not
+# an error - the row is already created, so the listing sits in `processing` for ever
+# and the app waits on a reply that is never coming.
+#
+# 1600 is chosen against what the output actually is: `enhance` composes onto a
+# 1400x1400 canvas with the subject at 1232px, and the vision model sees far less than
+# that. So nothing downstream can tell the difference, and the resize is recorded in
+# the operations log either way, because a passport that omits a resize is not a
+# record.
+WORK_MAX_PX = int(os.getenv("WORK_MAX_PX") or "1600")
+
+
+def fit_for_pipeline(data: bytes) -> tuple[bytes, list[str]]:
+    """
+    Decode once, cap the longest edge, and hand back JPEG bytes plus the ops log.
+
+    Returns the bytes unchanged when the photograph is already small enough, so a
+    modest image is never re-encoded and never loses a generation to JPEG.
+    """
+    if not WORK_MAX_PX:
+        return data, []
+    try:
+        src = ImageOps.exif_transpose(Image.open(io.BytesIO(data)))
+    except Exception as e:
+        # Not this function's job to decide a photograph is unusable. Hand the bytes
+        # on and let the step that needs them fail with something specific.
+        log.warning("could not pre-scale the photograph (%s); passing it through", e)
+        return data, []
+
+    if max(src.width, src.height) <= WORK_MAX_PX:
+        return data, []
+
+    before = f"{src.width}x{src.height}"
+    src = src.convert("RGB")
+    src.thumbnail((WORK_MAX_PX, WORK_MAX_PX), Image.LANCZOS)
+    buf = io.BytesIO()
+    src.save(buf, format="JPEG", quality=92, optimize=True)
+    out = buf.getvalue()
+    log.info("pre-scaled %s -> %dx%d (%d KB -> %d KB)",
+             before, src.width, src.height, len(data) // 1024, len(out) // 1024)
+    return out, [f"resize:{before} -> {src.width}x{src.height} "
+                 f"(working resolution, longest edge {WORK_MAX_PX})"]
+
+
 def _rembg_session():
     """
     Loaded lazily, on the first photograph rather than at import.

@@ -52,6 +52,10 @@ def analyse_into(s, listing, data: bytes, *, transcript: str = "",
     """
     if skip_models:
         on_stage("storing", 60)
+        # Capped here too. Manual mode runs no models, but it still decodes the
+        # photograph and saves two copies of it, which is enough on its own to run a
+        # 512 MB container out of memory.
+        data, fit_ops = imaging.fit_for_pipeline(data)
         img = imaging.Image.open(io.BytesIO(data))
         url = save_media(img, listing.id, "final")
         thumb = img.copy()
@@ -63,7 +67,8 @@ def analyse_into(s, listing, data: bytes, *, transcript: str = "",
         # the photograph. The passport page shows the same file on both sides, which
         # is the honest thing for it to show.
         listing.raw_url = url
-        listing.enhance_ops = ["manual: stored as taken, no models run"]
+        listing.enhance_ops = (fit_ops
+                               + ["manual: stored as taken, no models run"])
         listing.vision = {"thumbUrl": thumb_url, "notes": "manual mode: not analysed"}
         listing.transcript = transcript or listing.transcript
         listing.status = "draft"
@@ -86,10 +91,24 @@ def analyse_into(s, listing, data: bytes, *, transcript: str = "",
     lid = listing.id
     ops: list[str] = []
 
+    # Cap the working resolution before anything touches the photograph.
+    #
+    # Deliberately after raw_hash, which stays the hash of the bytes the phone sent:
+    # /v1/analyze matches a retried upload on that hash to avoid making a second
+    # listing, and it has only the original to hash.
+    data, fit_ops = imaging.fit_for_pipeline(data)
+    ops += fit_ops
+
     # -- OCR (local, deterministic) ----------------------------------------
     on_stage("reading", 20)
     ocr = vision.run_ocr(data)
-    ops.append(f"ocr:rapidocr {len(ocr.get('boxes', []))} text boxes")
+    # Report what happened, not what was meant to happen. With LOCAL_VISION=off this
+    # said "ocr:rapidocr 0 text boxes", which reads as a photograph with no writing
+    # on it rather than an OCR engine that was never loaded - and the passport signs
+    # this line.
+    ops.append(f"ocr:rapidocr {len(ocr.get('boxes', []))} text boxes"
+               if ocr.get("ok") else
+               f"ocr:not run ({ocr.get('error', 'unavailable')[:60]})")
 
     # -- detection + image-grounded extraction ------------------------------
     on_stage("detecting", 40)

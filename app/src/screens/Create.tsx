@@ -1130,6 +1130,12 @@ export default function Create({
                    subtitle={analysis
                      ? t('create.detectSub', { n: analysis.ocr?.boxes?.length ?? 0, ms: analysis.ms })
                      : mode === 'manual' ? t('create.detectSkipped')
+                     // Busy is not offline, and saying "no connection" while a
+                     // request is in flight is the app lying about its own state.
+                     // Against the deployed backend this step takes minutes, so this
+                     // caption was on screen for the whole time it was working.
+                     : busy ? t('create.detectWorking')
+                     : err ? err
                                          : t('create.detectOffline')}
                    state={st(1)}>
             {!analysis ? (
@@ -1139,7 +1145,10 @@ export default function Create({
               // step is complete enough to move past.
               <Card tone="soft">
                 <Text style={T.bodySoft}>
-                  {mode === 'manual' ? t('create.detectSkipped') : t('create.detectOffline')}
+                  {mode === 'manual' ? t('create.detectSkipped')
+                   : busy ? t('create.detectWorking')
+                   : err ? err
+                   : t('create.detectOffline')}
                 </Text>
                 <View style={{ flexDirection: 'row', gap: S.sm }}>
                   {rawUri ? (

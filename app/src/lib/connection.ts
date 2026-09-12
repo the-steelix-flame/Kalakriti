@@ -81,5 +81,29 @@ export function suggest(r: Reading): 'auto' | 'manual' {
  * that drops halfway through.
  */
 export function useBackgroundJob(r: Reading): boolean {
-  return r.speed !== 'fast' || r.cellular;
+  return r.speed !== 'fast' || r.cellular || !onLocalBackend();
+}
+
+/**
+ * Is the backend on this network, or is it the deployed one?
+ *
+ * This is the other half of the question, and leaving it out was a real bug. The
+ * reading above measures the *phone's* connection, and on office wifi it says
+ * "fast", so a held request looked like a safe idea. It is not, because the thing at
+ * the other end is a free-tier container: the copywriting call alone was measured at
+ * 91 seconds against the deployed backend, and the full pipeline - vision model,
+ * image work, three uploads, then the copy - runs into minutes.
+ *
+ * What the artisan saw was a create screen that sat there, apparently frozen, under a
+ * caption that said there was no connection. There was; it was just slow.
+ *
+ * So a remote backend always goes through the job queue, whatever the wifi is doing.
+ * A backend on a private address is a laptop on the same network, which is genuinely
+ * fast and can hold a request.
+ */
+function onLocalBackend(): boolean {
+  const base = apiBase();
+  if (!base) return false;
+  return /^https?:\/\/(localhost|127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/
+    .test(base);
 }

@@ -32,7 +32,7 @@ USER kalakriti
 # them at build time means the first artisan to upload a photo does not wait for a
 # download, and the container works on a host with no outbound access to that CDN.
 # Run as the same user that will read them later, or they land in /root.
-RUN python -c "from rembg.sessions import new_session; new_session('u2net')" || \
+RUN python -c "from rembg import new_session; new_session('u2net')" || \
     echo "warning: could not pre-fetch u2net; it will download on first use"
 
 # 7860 is the port Hugging Face Spaces expects, and it is declared again as

@@ -18,21 +18,31 @@ because `onnxruntime` plus the U²-Net matting weights plus the OCR models all s
 memory. On Render free it is OOM-killed on the first photograph, and the symptom is a
 restart loop rather than an error message.
 
-A free Hugging Face Docker Space gets **2 vCPU and 16 GB of RAM**. It is the only
-genuinely free tier with the memory this needs.
+A free Hugging Face Space gets **2 vCPU and 16 GB of RAM** on CPU basic. It is the
+only genuinely free tier with the memory this needs.
+
+This guide uses the **Gradio SDK rather than Docker**, so there is no Dockerfile in
+the loop. The Dockerfile stays in the repository and still works; see the note at the
+end of step 3 for switching back.
 
 The trade: a free Space sleeps after 48 hours of no traffic, which
 `.github/workflows/keepalive.yml` handles, and its filesystem is wiped on every
-rebuild, which step 2 handles.
+rebuild, which steps 1 and 2 handle.
 
 ---
 
-## Step 1 — Product photos must move off the filesystem first
+## Step 1 — Product photos off the filesystem  ✅ already done
 
-**Do this before deploying, not after.** A Space's disk is ephemeral. There are 85
-photographs sitting in `backend/media/` right now, and on a Space they would vanish
-at the next rebuild. Every listing would show a broken image, including ones already
-published with a live URL a buyer might open.
+> **This is finished.** `MEDIA_S3_*` is configured against Supabase Storage, all
+> fourteen listings with images point at the bucket, and a sample of six returned
+> HTTP 200. The files still sitting in `backend/media/` are leftover originals; they
+> are not referenced by anything and do not need uploading.
+>
+> Keep reading only if you are setting this up on a fresh Supabase project.
+
+**Why it had to come first.** A Space's disk is ephemeral. Photographs on local disk
+vanish at the next rebuild, and every listing would show a broken image - including
+ones already published with a live URL a buyer might open.
 
 You already have somewhere to put them: your Supabase project includes S3-compatible
 storage, so this needs no new account.
@@ -90,21 +100,27 @@ your laptop share one identity and nobody is logged out when you switch.
 
 ---
 
-## Step 3 — Create the Space
+## Step 3 — Create the Space (no Docker)
 
-1. **huggingface.co → New Space.** SDK **Docker**, template **blank**, hardware
-   **CPU basic (free)**, visibility **Public**.
+1. **huggingface.co → New Space.** SDK **Gradio**, hardware **CPU basic (free)**,
+   visibility **Public**.
 
    Public is not optional on the free tier: a private Space needs a token on every
-   request, and buyers opening a storefront link have no token.
+   request, and a buyer opening a storefront link has no token.
 
-2. The repository already carries what a Space reads on every build, so do not delete
-   either:
-   - `Dockerfile` at the root - already written for a Space: uid 1000, port 7860,
-     the matting weights pre-fetched at build time so the first artisan does not wait
-     for a 176 MB download.
-   - The YAML front matter at the top of `README.md` - `sdk: docker` and
-     `app_port: 7860`.
+2. The repository already carries everything a non-Docker Space reads. Do not delete
+   any of it:
+
+   | File | What the Space does with it |
+   |---|---|
+   | `app.py` | The one file it runs. Puts `backend/` on the path and starts uvicorn on port 7860. |
+   | `requirements.txt` | Installed with pip. It just includes `backend/requirements.txt`, so versions are pinned in one place. |
+   | `packages.txt` | Installed with apt. Two libraries opencv needs - the non-Docker equivalent of the Dockerfile's apt line. |
+   | README front matter | `sdk: gradio`, `app_file: app.py`. This is what selects the SDK. |
+
+   **Nothing imports gradio and no Gradio interface is served.** The Gradio SDK is
+   simply how a Space runs a plain Python process: install the requirements, install
+   the apt packages, run one file. `app.py` starts the real FastAPI app.
 
 3. Push this repository to the Space:
 
@@ -115,6 +131,13 @@ your laptop share one identity and nobody is logged out when you switch.
 
    It asks for your username and an **access token** as the password. Create one at
    huggingface.co → Settings → Access Tokens, with **write** permission.
+
+> **If you would rather use Docker after all**, the `Dockerfile` is still in the
+> repository and still correct. Change the front matter back to `sdk: docker` and
+> `app_port: 7860`, and delete nothing. The only real difference is that Docker
+> pre-fetches the 176 MB matting weights during the build, while this route fetches
+> them on a background thread at startup - so the first photograph after a cold start
+> is a little slower on a Gradio Space and identical afterwards.
 
 ---
 
@@ -163,9 +186,13 @@ Then check it, rather than assuming:
 curl https://<your-user>-<space-name>.hf.space/health
 ```
 
-The first build takes several minutes, most of it installing `onnxruntime` and
-fetching the matting weights. Watch the build log on the Space page; a crash there is
-almost always a missing secret, and it names it.
+The first build takes several minutes, most of it installing `onnxruntime`,
+`opencv` and `gradio`. Watch the build log on the Space page; a crash there is almost
+always a missing secret, and it names it.
+
+The matting weights are fetched after the build, on a background thread as the app
+starts, so the Space answers `/health` before that finishes. The log line to look for
+is `u2net ready`.
 
 ---
 

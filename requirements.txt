@@ -1,0 +1,17 @@
+# Dependencies for a non-Docker Hugging Face Space.
+#
+# A Space installs the requirements.txt at the repository root, and the real list
+# lives in backend/. Rather than keep two copies that drift, this includes that one -
+# pip resolves `-r` relative to this file, so there is still exactly one place where
+# a version is pinned.
+#
+# The apt packages opencv needs (libgl1, libglib2.0-0) are in packages.txt beside
+# this, which is the non-Docker equivalent of the Dockerfile's apt-get line.
+-r backend/requirements.txt
+
+# Only the Space needs this. The `gradio` SDK is how a Space runs a plain Python
+# process: it installs these requirements, installs packages.txt, and then runs
+# app.py, which starts uvicorn on port 7860. Nothing in this project imports gradio
+# and no Gradio interface is served - it is the platform's launcher, not a dependency
+# of the application, which is why it is pinned here and not in backend/.
+gradio==5.9.1

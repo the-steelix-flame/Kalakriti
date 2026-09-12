@@ -3,10 +3,28 @@ title: Kalakriti
 emoji: 🧵
 colorFrom: indigo
 colorTo: green
-sdk: docker
-app_port: 7860
+sdk: gradio
+sdk_version: 5.9.1
+app_file: app.py
 pinned: false
 ---
+
+<!--
+  The front matter above is what a Hugging Face Space reads, and it selects the SDK.
+
+  `sdk: gradio` means: install requirements.txt, install packages.txt, then run
+  app.py. Nothing here imports gradio and no Gradio interface is served - it is the
+  platform's launcher for a plain Python process, and app.py starts uvicorn on 7860.
+
+  To go back to a Docker Space, replace the two `sdk*` lines and `app_file` with:
+
+      sdk: docker
+      app_port: 7860
+
+  The Dockerfile is still in the repository and still correct. It pre-fetches the
+  176 MB matting weights at build time, which this route does on a background thread
+  at startup instead. That is the only real difference between the two.
+-->
 
 # Kalakriti · कलाकृति
 

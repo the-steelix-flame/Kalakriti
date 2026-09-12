@@ -46,7 +46,8 @@ const SORTS: SortDef<api.Order>[] = [
 ];
 
 export default function OrdersTab({
-  orders, loading, artisan, offline, onLanguage, onRefresh, onShip, onLogin, onOpenProduct,
+  orders, loading, artisan, offline, onLanguage, onRefresh, onShip, onLogin,
+  onOpenProduct, onTrack, onBoard,
 }: {
   orders: api.Order[];
   loading: boolean;
@@ -57,6 +58,12 @@ export default function OrdersTab({
   onShip: (id: string) => Promise<void>;
   onLogin: () => void;
   onOpenProduct?: (id: string) => void;
+  /** Opens this order's tracker: the stage it is at, who moved it there, and the one
+   *  button this person is allowed to press next. */
+  onTrack?: (orderId: string) => void;
+  /** Opens the transit board: stage counts across every order, which is the view that
+   *  answers "where is everything" rather than "what is this one doing". */
+  onBoard?: () => void;
 }) {
   const { t } = useI18n();
   const [filter, setFilter] = useState('all');
@@ -93,6 +100,13 @@ export default function OrdersTab({
       refreshControl={<RefreshControl refreshing={loading} onRefresh={onRefresh}
                                       tintColor={C.primary} />}
     >
+      {/* Above the list, because "where is everything" is the question somebody opens
+          this tab holding, and a flat list cannot answer it. */}
+      {onBoard ? (
+        <Btn label={t('ord.openBoard')} sub={t('ord.openBoardSub')} tone="indigo"
+             onPress={onBoard} />
+      ) : null}
+
       <FilterBar items={orders} filters={FILTERS} filter={filter} onFilter={setFilter}
                  sorts={SORTS} sort={sort} onSort={setSort} />
 
@@ -151,6 +165,13 @@ export default function OrdersTab({
                   </Pressable>
                 ) : null}
               </>
+            ) : null}
+
+            {/* The tracker is the primary action on an order now. Shipping is one
+                stage inside the journey rather than the only thing to do with it. */}
+            {onTrack ? (
+              <Btn label={t('ord.track')} tone="indigo"
+                   onPress={() => onTrack(o.id)} />
             ) : null}
 
             {canShip ? (

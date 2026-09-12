@@ -11,7 +11,7 @@ import {
 import { C, GRAD, S, T, R, shadow } from '../theme';
 import {
   Camera, Gallery, Mic, Sparkle, Shield, Check, Arrow, Tag, Rupee, Globe, Warning,
-  Speaker, Home as HomeIcon,
+  Speaker, Home as HomeIcon, Users,
 } from '../icons';
 import * as api from '../lib/api';
 import * as session from '../lib/session';
@@ -50,7 +50,7 @@ import * as cache from '../lib/cache';
 
 const STEPS = [
   'create.step.photo', 'create.step.detect', 'create.step.info',
-  'create.step.price', 'create.step.channels', 'create.step.live',
+  'create.step.price', 'create.step.clusters', 'create.step.live',
 ];
 
 
@@ -87,8 +87,11 @@ function FieldWithAi({
 }
 
 export default function Create({
-  onHome, resumeId,
-}: { onHome: () => void; resumeId?: string | null }) {
+  onHome, resumeId, onClusters,
+}: { onHome: () => void; resumeId?: string | null;
+     /** Opens the cluster browser. Optional so this screen still renders for a caller
+      *  that has nowhere to send her - the picker then just shows the storefront. */
+     onClusters?: () => void }) {
   // ── form state (the single source of truth while editing) ────────────────
   const [rawUri, setRawUri] = useState<string | null>(null);
   /** The draft on this phone. Exists from the first photograph, offline or not. */
@@ -166,6 +169,14 @@ export default function Create({
   const recognizer = useRef<Listener | null>(null);
 
   const [chans, setChans] = useState<api.Channel[]>([]);
+
+  // Which cluster sells this product. `null` clusters means "not loaded yet", which
+  // is a different thing from an empty list - an artisan who belongs to no cluster
+  // needs to be told that, not shown a spinner for ever.
+  const [clusters, setClusters] = useState<api.Cluster[] | null>(null);
+  const [clusterId, setClusterId] = useState<string>('');
+  const [savingCluster, setSavingCluster] = useState(false);
+  const [clusterErr, setClusterErr] = useState('');
   const [picked, setPicked] = useState<string[]>(['storefront']);
   const [pubs, setPubs] = useState<api.Publication[]>([]);
   const [live, setLive] = useState<api.Listing | null>(null);
@@ -254,6 +265,54 @@ export default function Create({
     return () => { alive = false; };
   }, []);
 
+  // The clusters this artisan may sell through: the ones she has joined, plus any she
+  // owns. Signed out there are none, and the picker then offers only her storefront -
+  // which is correct, because joining a cluster requires an account.
+  useEffect(() => {
+    let alive = true;
+    if (!artisan) { setClusters([]); return () => { alive = false; }; }
+    api.myClusters()
+      .then((r) => {
+        if (!alive) return;
+        // Owned first: a cluster creator listing her own work almost always means the
+        // cluster she runs, and it should not be buried under ones she joined.
+        const seen = new Set<string>();
+        const all = [...(r.owned || []), ...(r.clusters || [])]
+          .filter((c) => (seen.has(c.id) ? false : (seen.add(c.id), true)));
+        setClusters(all);
+      })
+      .catch(() => { if (alive) setClusters([]); });
+    return () => { alive = false; };
+  }, [artisan]);
+
+  /**
+   * Choose the cluster, and save it before anything else can go wrong.
+   *
+   * Written straight through to the server rather than held until publish, because
+   * this is the field that decides who the seller of record is. Leaving it in local
+   * state until the end means a crash loses the one answer that determines whose
+   * GSTIN the sale happens under.
+   */
+  async function pickCluster(id: string) {
+    const was = clusterId;
+    setClusterId(id);
+    setClusterErr('');
+    const lid = listingIdRef.current ?? listingId;
+    if (!lid) return;                 // nothing to attach it to yet; saved on create
+    setSavingCluster(true);
+    try {
+      await api.updateListing(lid, { clusterId: id });
+    } catch (e: any) {
+      // The server refuses a cluster she is not a member of. Rolling the selection
+      // back is the honest response: leaving it highlighted would show her a seller
+      // of record that is not actually recorded.
+      setClusterId(was);
+      setClusterErr(e?.message || 'That cluster did not accept this product.');
+    } finally {
+      setSavingCluster(false);
+    }
+  }
+
   useEffect(() => {
     api.bootstrap()
       .then((b) => { setArtisan(b.artisan); setReadiness(b.marketplaceReadiness); })
@@ -288,6 +347,7 @@ export default function Create({
         if (Array.isArray(f.channelsSelected) && f.channelsSelected.length) {
           setPicked(f.channelsSelected);
         }
+        if (typeof f.clusterId === 'string') setClusterId(f.clusterId);
         if (Array.isArray(f.priceBreakdown) && f.priceBreakdown.length) {
           setBreakdown(f.priceBreakdown.map((b: any, i: number) => ({
             id: `bd_local_${i}`, label: String(b.label ?? ''),
@@ -311,6 +371,8 @@ export default function Create({
       setQtyStr(String(l.quantity || 1));
       setTranscript(l.transcript || '');
       if (l.channelsSelected?.length) setPicked(l.channelsSelected);
+      // Whose GSTIN this sells under, restored with everything else.
+      setClusterId(l.clusterId || '');
       const savedBd = (l.attributes as any)?.priceBreakdown;
       if (Array.isArray(savedBd) && savedBd.length) {
         setBreakdown(savedBd.map((b: any, i: number) => ({
@@ -1452,47 +1514,103 @@ export default function Create({
         {/* ── 5. channels + preview ────────────────────────────────────── */}
         {hasPhoto ? (
           <View onLayout={markSection(4)}>
-          <Section n={5} title={t('create.step.channels')} subtitle={t('create.channelsSub')}
+          <Section n={5} title={t('create.step.clusters')} subtitle={t('create.clustersSub')}
                    state={st(4)}>
-            {!chans.length ? (
+            {/* Which cluster sells this product.
+
+                This replaced a row of marketplace cards - ONDC, GeM, Amazon Karigar,
+                Shopify - each reading "Setup pending". Those were not the artisan's
+                decision to make: a marketplace seller account needs a GSTIN she does
+                not have, which is the entire reason the cluster exists. The cluster
+                owner holds the GST and is the seller of record, so choosing a cluster
+                is the real, actionable version of the same step, and the marketplace
+                plumbing sits behind it where it belongs.
+
+                Optional on purpose. No cluster means the product sells on her own
+                storefront, which already works and needs nobody's permission. */}
+            {clusters === null ? (
               <Card tone="soft">
-                <Text style={T.bodySoft}>{t('create.channelsOffline')}</Text>
+                <Text style={T.bodySoft}>{t('create.clustersLoading')}</Text>
               </Card>
-            ) : null}
-            {chans.map((c) => {
-              const on = picked.includes(c.id);
-              return (
-                <Pressable key={c.id} onPress={() => setPicked((p) =>
-                  p.includes(c.id) ? p.filter((x) => x !== c.id) : [...p, c.id])}>
-                  <View style={[{ borderRadius: R.lg, padding: S.md, borderWidth: 1.5,
-                                  borderColor: on ? C.money : C.line,
-                                  backgroundColor: on ? C.moneySoft : C.surface,
-                                  flexDirection: 'row', alignItems: 'center', gap: S.md }]}>
-                    <View style={{ width: 40, height: 40, borderRadius: R.md,
-                                   backgroundColor: on ? C.money : C.bgAlt,
-                                   alignItems: 'center', justifyContent: 'center' }}>
-                      {on ? <Check color={C.white} size={20} />
-                          : <Globe color={C.inkSoft} size={18} />}
-                    </View>
-                    <View style={{ flex: 1 }}>
-                      <Text style={[T.body, { fontFamily: 'Mukta_700Bold' }]}>{c.name}</Text>
-                      <Text style={[T.micro, { fontSize: 12 }]}>{c.note}</Text>
-                    </View>
-                    {c.configured
-                      ? <Pill text={t('create.ready')} tone="good" />
-                      : <Pill text={t('create.setupPending')} tone="warn" />}
-                  </View>
-                </Pressable>
-              );
-            })}
-            {chans.some((c) => picked.includes(c.id) && !c.configured) ? (
-              <Card tone="warn">
-                <Text style={T.bodySoft}>
-                  कुछ चुने हुए चैनल अभी सेटअप नहीं हैं। भेजने की कोशिश होगी और असली
-                  नतीजा नीचे दिखेगा — झूठा "सफल" कभी नहीं दिखाया जाएगा।
+            ) : clusters.length === 0 ? (
+              <Card tone="soft">
+                <Text style={[T.body, { fontFamily: 'Mukta_600SemiBold' }]}>
+                  {t('create.noClusters')}
                 </Text>
+                <Text style={T.bodySoft}>{t('create.noClustersWhy')}</Text>
+                {onClusters ? (
+                  <Btn label={t('create.findCluster')} tone="tonal"
+                       onPress={onClusters} />
+                ) : null}
               </Card>
-            ) : null}
+            ) : (
+              <>
+                {[{ id: '', name: t('create.ownStorefront'),
+                    note: t('create.ownStorefrontNote'), commissionPct: 0,
+                    owner: '' },
+                  ...clusters.map((c) => ({
+                    id: c.id, name: c.name,
+                    note: [c.craftCategory, c.district].filter(Boolean).join(' · '),
+                    commissionPct: c.commissionPct,
+                    owner: c.viewerIsOwner ? t('create.yours') : c.ownerName,
+                  }))].map((c) => {
+                  const on = (clusterId || '') === c.id;
+                  return (
+                    <Pressable
+                      key={c.id || 'storefront'}
+                      onPress={() => pickCluster(c.id)}
+                      accessibilityRole="button"
+                      accessibilityState={{ selected: on }}
+                      disabled={savingCluster}
+                    >
+                      <View style={{
+                        borderRadius: R.lg, padding: S.md, borderWidth: 1.5,
+                        borderColor: on ? C.money : C.line,
+                        backgroundColor: on ? C.moneySoft : C.surface,
+                        flexDirection: 'row', alignItems: 'center', gap: S.md,
+                        opacity: savingCluster ? 0.6 : 1,
+                      }}>
+                        <View style={{ width: 40, height: 40, borderRadius: R.md,
+                                       backgroundColor: on ? C.money : C.bgAlt,
+                                       alignItems: 'center', justifyContent: 'center' }}>
+                          {on ? <Check color={C.white} size={20} />
+                              : <Users color={C.inkSoft} size={18} />}
+                        </View>
+                        <View style={{ flex: 1, gap: 1 }}>
+                          <Text style={[T.body, { fontFamily: 'Mukta_700Bold' }]}
+                                numberOfLines={1}>
+                            {c.name}
+                          </Text>
+                          {c.note ? (
+                            <Text style={[T.micro, { fontSize: 12 }]} numberOfLines={1}>
+                              {c.note}
+                            </Text>
+                          ) : null}
+                          {c.owner ? (
+                            <Text style={[T.micro, { fontSize: 11.5 }]}
+                                  numberOfLines={1}>
+                              {t('create.clusterOwner')}: {c.owner}
+                            </Text>
+                          ) : null}
+                        </View>
+                        {/* The commission is the number that decides whether this is
+                            worth it to her, so it is on the card rather than a tap
+                            away. */}
+                        {c.id ? (
+                          <Pill text={`${c.commissionPct}%`}
+                                tone={on ? 'good' : undefined} />
+                        ) : null}
+                      </View>
+                    </Pressable>
+                  );
+                })}
+                {clusterErr ? (
+                  <Card tone="danger">
+                    <Text style={T.bodySoft}>{clusterErr}</Text>
+                  </Card>
+                ) : null}
+              </>
+            )}
 
             <Card>
               <Text style={T.label}>{t('create.review')}</Text>
@@ -1563,7 +1681,7 @@ export default function Create({
                   <StatusChip status={p.status} />
                 </View>
                 {p.url ? (
-                  <Pressable onPress={() => Linking.openURL(p.url)}>
+                  <Pressable onPress={() => Linking.openURL(api.localise(p.url))}>
                     <Text style={[T.bodySoft, { color: C.indigo,
                                                 textDecorationLine: 'underline' }]}>
                       {p.url}
@@ -1631,7 +1749,7 @@ export default function Create({
                   </View>
                 </View>
                 {passport.verifyUrl ? (
-                  <Pressable onPress={() => Linking.openURL(passport.verifyUrl)}>
+                  <Pressable onPress={() => Linking.openURL(api.localise(passport.verifyUrl))}>
                     <Text style={[T.micro, { color: C.primaryLite, fontSize: 12 }]}>
                       {t('create.passportVerify')}
                     </Text>

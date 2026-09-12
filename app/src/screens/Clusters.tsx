@@ -176,11 +176,15 @@ function ClusterCard({
 /* ────────────────────────────────────────────────────────────── the screen */
 
 export default function Clusters({
-  onBack, onLanguage, onChanged,
+  onBack, onLanguage, onChanged, onOpenOps,
 }: {
   onBack: () => void;
   onLanguage: () => void;
   onChanged?: () => void;
+  /** Opens the operator view of a cluster: its listings, orders and roster. Only
+   *  offered for clusters this person owns, because that view carries buyer names and
+   *  delivery addresses and the server refuses it to everybody else anyway. */
+  onOpenOps?: (clusterId: string) => void;
 }) {
   const { t } = useI18n();
   const [tab, setTab] = useState<Tab>('mine');
@@ -327,13 +331,20 @@ export default function Clusters({
           <View style={{ gap: S.sm }}>
             <Text style={[T.label, { color: C.inkSoft }]}>{t('cd.title')}</Text>
             {owned.map((c) => (
-              <Card key={c.id} tone="money" style={{ gap: 4 }}>
+              <Card key={c.id} tone="money" style={{ gap: 4 }}
+                    onPress={onOpenOps ? () => onOpenOps(c.id) : undefined}>
                 <Text style={[T.body, { fontFamily: 'Mukta_800ExtraBold' }]}>{c.name}</Text>
                 <Text style={[T.micro, { color: C.inkMid }]}>
                   {t('clu.members', { n: c.memberCount })}
                   {'   ·   '}
                   {t('cd.invite')}: {c.inviteCode}
                 </Text>
+                {onOpenOps ? (
+                  <Text style={[T.micro, { fontSize: 12, color: C.moneyDeep,
+                                           fontFamily: 'Mukta_600SemiBold' }]}>
+                    {t('clu.openOps')}
+                  </Text>
+                ) : null}
               </Card>
             ))}
           </View>

@@ -39,3 +39,7 @@ Thumbs.db
 # Rows removed by dedupe_listings.py, kept so a deletion is reversible. Real
 # listing data from whoever ran it, and of no use to anybody else.
 backend/dedupe-backups/
+
+# JSON snapshots of rows cleanup_listings.py removed. Real listing data,
+# kept locally so a wrong call can be undone, and not ours to publish.
+backend/cleanup-backups/

@@ -111,7 +111,7 @@ export default function MarketplaceDetail({
           {m.externalId ? <Row label={t('mp.listingId')} value={m.externalId} /> : null}
           {m.submittedAt ? <Row label={t('mp.created')} value={ago(t, m.submittedAt)} /> : null}
           {m.url ? (
-            <Pressable onPress={() => Linking.openURL(m.url)}
+            <Pressable onPress={() => Linking.openURL(api.localise(m.url))}
                        accessibilityLabel={t('mp.openPage')}>
               <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6,
                              paddingVertical: 8 }}>

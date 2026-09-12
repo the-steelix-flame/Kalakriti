@@ -502,6 +502,19 @@ class Listing(Base):
     transcript = Column(Text, default="")
     channels_selected = Column(JSONType, default=list)
 
+    # Which cluster this product is offered through.
+    #
+    # The cluster owner is the seller of record - they hold the GSTIN and are the
+    # party a marketplace, a courier and a buyer can actually transact with. An
+    # artisan without GST reaches a buyer through one, which is the whole point of
+    # the cooperative model, so the link belongs on the listing rather than being
+    # inferred from whichever cluster the artisan happens to be in: an artisan can be
+    # in several, and which one sells a given pot is a decision, not a lookup.
+    #
+    # Nullable and empty by default. A listing sold on the artisan's own storefront
+    # has no cluster, and that is a legitimate state rather than missing data.
+    cluster_id = Column(String, ForeignKey("clusters.id"), nullable=True, index=True)
+
     status = Column(String, default="draft")
     created_at = Column(DateTime, default=now)
     updated_at = Column(DateTime, default=now, onupdate=now)
@@ -525,6 +538,7 @@ class Listing(Base):
             "enhanceOps": self.enhance_ops or [], "vision": self.vision or {},
             "ocr": self.ocr or {}, "transcript": self.transcript,
             "channelsSelected": self.channels_selected or [],
+            "clusterId": self.cluster_id or "",
             "status": self.status,
             "createdAt": self.created_at.isoformat() if self.created_at else None,
             "updatedAt": self.updated_at.isoformat() if self.updated_at else None,

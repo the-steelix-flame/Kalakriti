@@ -46,10 +46,18 @@ def listings(s, *, q: str = "", category: str = "", limit: int = 60) -> list[dic
 
     Drafts are excluded, and so is anything out of stock - a shop that shows you
     things you cannot buy is wasting the one screen of attention you get.
+
+    A listing with no photograph is excluded for the same reason. Nobody buys a grey
+    rectangle, and one of these was sitting in the shop as a broken image: an old test
+    row that had been published to two channels without a picture ever being taken. It
+    is filtered here rather than deleted or forced back to draft, because the row is
+    real and its publications are real - it is only unfit for a shelf.
     """
     query = (s.query(db.Listing)
              .filter(db.Listing.status.in_(("active", "published")),
-                     db.Listing.quantity > 0))
+                     db.Listing.quantity > 0,
+                     db.Listing.image_url != "",
+                     db.Listing.image_url.isnot(None)))
     if category:
         query = query.filter(db.Listing.category == category)
     if q:
@@ -77,10 +85,70 @@ def listings(s, *, q: str = "", category: str = "", limit: int = 60) -> list[dic
     return out
 
 
+def item(s, lid: str) -> dict | None:
+    """
+    One product, for the buyer's detail screen inside the app.
+
+    A superset of what `listings` returns: the description, the dimensions and the
+    seller of record, which a grid tile has no room for but a buyer deciding to spend
+    money does want. Returns None rather than raising, so the route decides the status
+    code.
+
+    The same shelf rules apply. A draft, an out-of-stock row or one with no photograph
+    is not for sale, and answering with it would let the app offer a buy button for
+    something the order endpoint will refuse.
+    """
+    r = s.get(db.Listing, lid)
+    if r is None:
+        return None
+    if (r.status not in ("active", "published") or (r.quantity or 0) <= 0
+            or not (r.image_url or "").strip()):
+        return None
+
+    a = s.get(db.Artisan, r.artisan_id) if r.artisan_id else None
+
+    # Who the buyer is actually paying. A listing sold through a cluster is sold by the
+    # cluster owner - they hold the GSTIN and are the seller of record - and the maker
+    # is still named, because that is the whole point of the platform.
+    seller, seller_kind = "", ""
+    if r.cluster_id:
+        cl = s.get(db.Cluster, r.cluster_id)
+        if cl is not None:
+            seller, seller_kind = cl.name or "", "cluster"
+    if not seller and a is not None:
+        seller = a.business_name or a.full_name or ""
+        seller_kind = "artisan"
+
+    return {
+        "id": r.id,
+        "title": r.title_en or r.title_hi or "Handmade piece",
+        "titleHi": r.title_hi or "",
+        "description": r.desc_en or "",
+        "descriptionHi": r.desc_hi or "",
+        "price": r.price or 0,
+        "currency": r.currency or CURRENCY,
+        "imageUrl": r.image_url or "",
+        "category": r.category or "",
+        "hsn": r.hsn or "",
+        "quantity": r.quantity or 0,
+        "maker": (a.business_name or a.full_name) if a else "",
+        "makerCluster": (a.cluster or "") if a else "",
+        "seller": seller,
+        "sellerKind": seller_kind,
+        "weightG": r.weight_g or 0,
+        "dimensionsCm": {"length": r.length_cm or 0, "breadth": r.breadth_cm or 0,
+                         "height": r.height_cm or 0},
+        "passportId": r.passport_id or "",
+        "url": f"/l/{r.id}",
+    }
+
+
 def categories(s) -> list[str]:
     rows = (s.query(db.Listing.category)
             .filter(db.Listing.status.in_(("active", "published")),
                     db.Listing.quantity > 0,
+                    db.Listing.image_url != "",
+                    db.Listing.image_url.isnot(None),
                     db.Listing.category != "")
             .distinct().all())
     return sorted({c for (c,) in rows if c})

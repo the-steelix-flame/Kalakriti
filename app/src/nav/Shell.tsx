@@ -3,7 +3,7 @@ import { View, Text, Pressable, ScrollView, Platform } from 'react-native';
 import type { RefreshControlProps } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { C, S, T, R, shadow } from '../theme';
-import { Home as HomeIcon, Tag, Rupee, Users, Globe } from '../icons';
+import { Home as HomeIcon, Tag, Rupee, Users, Globe, Check, Trend } from '../icons';
 import { useI18n } from '../i18n';
 
 /**
@@ -22,12 +22,23 @@ import { useI18n } from '../i18n';
  *    gesture pill and content is never hidden behind the bar.
  */
 
-export type TabKey = 'home' | 'products' | 'orders' | 'profile';
+// Five, because the work splits five ways: see what needs doing, approve products,
+// move orders, read the money, manage the account.
+//
+// `home` keeps its key rather than being renamed to `dashboard`. The key is persisted
+// in session state, so renaming it would drop every returning user onto a tab they did
+// not choose, and the label is what they actually read.
+//
+// `products` is gone from the bar and is NOT gone from the app: it is reached from the
+// dashboard and from Approvals, both of which land on it with a filter already applied,
+// which is more useful than an unfiltered list of everything.
+export type TabKey = 'home' | 'approvals' | 'orders' | 'reports' | 'profile';
 
 const TABS: { key: TabKey; icon: any; labelKey: string }[] = [
-  { key: 'home', icon: HomeIcon, labelKey: 'nav.home' },
-  { key: 'products', icon: Tag, labelKey: 'nav.products' },
+  { key: 'home', icon: HomeIcon, labelKey: 'nav.dashboard' },
+  { key: 'approvals', icon: Check, labelKey: 'nav.approvals' },
   { key: 'orders', icon: Rupee, labelKey: 'nav.orders' },
+  { key: 'reports', icon: Trend, labelKey: 'nav.reports' },
   { key: 'profile', icon: Users, labelKey: 'nav.profile' },
 ];
 
@@ -189,9 +200,9 @@ export function TabBar({
                 numberOfLines={1}
                 style={{
                   fontFamily: on ? 'Mukta_700Bold' : 'Mukta_500Medium',
-                  fontSize: 11.5,
+                  fontSize: 10.5,
                   color: on ? C.primary : C.inkSoft,
-                  paddingHorizontal: 2,
+                  paddingHorizontal: 1,
                 }}
               >
                 {t(labelKey)}

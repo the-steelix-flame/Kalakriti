@@ -129,6 +129,44 @@ def save(img, listing_id: str, kind: str) -> str:
     return f"{PUBLIC_BASE}/media/{name}"
 
 
+def save_bytes(data: bytes, name: str, content_type: str) -> str:
+    """
+    Store a file we are not re-encoding, and return a URL that survives a redeploy.
+
+    `save` above exists for photographs: it takes a PIL image and writes JPEG, which
+    is right for a product picture and wrong for anything else. A packaging video is
+    already an H.264 file the phone produced; decoding and re-encoding it here would
+    cost minutes of CPU and lose quality for no reason, so the bytes go up as they
+    came off the camera.
+
+    Deliberately the same bucket, the same public base and the same
+    fall-through-to-disk behaviour as `save`, so there is one storage story to reason
+    about rather than two. `name` is the full object key including its extension,
+    because the caller knows what it recorded and this function should not guess.
+
+    Videos are NOT marked immutable for a year like photographs are. A packaging video
+    is evidence attached to one order and may need replacing if the artisan retakes it,
+    so a shorter cache window keeps a corrected file from being served stale.
+    """
+    s3 = _s3()
+    if s3:
+        c = _config()
+        try:
+            s3.put_object(Bucket=c["bucket"], Key=name, Body=data,
+                          ContentType=content_type,
+                          CacheControl="public, max-age=86400")
+            base = c["public"].rstrip("/") or f"{c['endpoint'].rstrip('/')}/{c['bucket']}"
+            return f"{base}/{name}"
+        except Exception as e:
+            log.error("media: S3 upload of %s failed (%s: %s); wrote to disk instead",
+                      name, type(e).__name__, e)
+
+    os.makedirs(LOCAL_DIR, exist_ok=True)
+    with open(os.path.join(LOCAL_DIR, name), "wb") as f:
+        f.write(data)
+    return f"{PUBLIC_BASE}/media/{name}"
+
+
 def hosted() -> bool:
     """
     Are we running on somebody else's container rather than a developer's laptop?

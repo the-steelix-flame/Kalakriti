@@ -47,6 +47,8 @@ import db  # noqa: E402
 import grn  # noqa: E402
 import logistics  # noqa: E402
 import market  # noqa: E402
+import transit  # noqa: E402
+import dashboard  # noqa: E402
 import ondc  # noqa: E402
 import passport  # noqa: E402
 import seller  # noqa: E402
@@ -129,13 +131,26 @@ def _save_media(img, listing_id: str, kind: str) -> str:
 
 @app.get("/media/{name}")
 def serve_media(name: str):
-    """Serve a locally stored image. Renamed from `media` because it
-    shadowed the media module and broke /health."""
-    path = os.path.join(MEDIA_DIR, os.path.basename(name))
+    """
+    Serve a locally stored media file. Renamed from `media` because it shadowed the
+    media module and broke /health.
+
+    The content type comes from the extension rather than being hardcoded to
+    image/jpeg. It was hardcoded, which was harmless while the only thing on disk was
+    a photograph and wrong the moment a packaging video landed here: a browser told an
+    .mp4 is a JPEG shows a broken image rather than a player. This path is the
+    fall-through for when object storage is unreachable, so it has to work.
+    """
+    safe = os.path.basename(name)
+    path = os.path.join(MEDIA_DIR, safe)
     if not os.path.exists(path):
         raise HTTPException(404, "not found")
+    ext = os.path.splitext(safe)[1].lower()
+    kind = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
+            ".webp": "image/webp", ".mp4": "video/mp4", ".mov": "video/quicktime",
+            ".m4v": "video/x-m4v"}.get(ext, "application/octet-stream")
     with open(path, "rb") as f:
-        return Response(f.read(), media_type="image/jpeg",
+        return Response(f.read(), media_type=kind,
                         headers={"Cache-Control": "public, max-age=86400"})
 
 
@@ -149,7 +164,10 @@ def preview() -> str:
 def health() -> dict[str, Any]:
     return {
         "ok": True,
-        "llm": "nemotron-3-ultra" if llm.available() else "not configured",
+        # The model that is actually configured, not a family name. This said
+        # "nemotron-3-ultra" while NEMOTRON_MODEL pointed at super-120b, which is the
+        # same kind of lie the ocr and matting fields used to tell.
+        "llm": llm.MODEL.rsplit("/", 1)[-1] if llm.available() else "not configured",
         "model": llm.MODEL,
         "vlm": vision.VLM_MODEL if llm.available() else "not configured",
         "ocr": ("rapidocr-onnxruntime (local)" if imaging.LOCAL_VISION
@@ -456,6 +474,9 @@ class ListingPatch(BaseModel):
     attributes: dict[str, Any] | None = None
     transcript: str | None = None
     status: str | None = None
+    # Which cluster sells this product. "" detaches it and puts it back on the
+    # artisan's own storefront, which is why this is a string rather than optional-only.
+    clusterId: str | None = None
 
 
 @app.get("/v1/listings")
@@ -683,8 +704,42 @@ def patch_listing(lid: str, body: ListingPatch,
             except ValueError:
                 moved = set()
 
+        # The cluster is handled before the generic loop because it is the only field
+        # here that is a permission rather than a value. An artisan may only offer a
+        # product through a cluster she actually belongs to, or one she owns -
+        # otherwise anybody could hang their listing off somebody else's GSTIN, which
+        # is the one thing the cluster owner is legally exposed on.
         conflicts = []
         changed = []
+        if body.clusterId is not None:
+            want = (body.clusterId or "").strip()
+            if not want:
+                if lst.cluster_id:
+                    db.log_event(s, "listing", lid, "cluster", lst.cluster_id or "", "",
+                                 "removed from cluster; back on the artisan's storefront")
+                lst.cluster_id = None
+                changed.append("clusterId")
+            else:
+                cl = s.get(db.Cluster, want)
+                if cl is None:
+                    raise HTTPException(404, "no such cluster")
+                owner = bool(lst.artisan_id) and cl.owner_artisan_id == lst.artisan_id
+                member = bool(lst.artisan_id) and bool(
+                    s.query(db.ClusterMembership)
+                     .filter(db.ClusterMembership.cluster_id == want,
+                             db.ClusterMembership.artisan_id == lst.artisan_id,
+                             db.ClusterMembership.status == "active")
+                     .first())
+                if not (owner or member):
+                    raise HTTPException(
+                        403, "you are not a member of that cluster, so it cannot sell "
+                             "this product")
+                if lst.cluster_id != want:
+                    db.log_event(s, "listing", lid, "cluster", lst.cluster_id or "",
+                                 want, f"offered through cluster {cl.name}")
+                    lst.cluster_id = want
+                    changed.append("clusterId")
+
         for k, col in m.items():
             v = getattr(body, k)
             if v is None:
@@ -2059,6 +2114,25 @@ def market_api(q: str = "", category: str = "", limit: int = 60) -> dict[str, An
         s.close()
 
 
+@app.get("/v1/market/{lid}")
+def market_item(lid: str) -> dict[str, Any]:
+    """
+    One product from the shop, as JSON, for the buyer's detail screen in the app.
+
+    Unauthenticated on purpose: a buyer browsing has no account, and the storefront
+    page at /l/{lid} is already public. Nothing private is in the response - the
+    artisan's phone number and address are not part of it.
+    """
+    s = db.session()
+    try:
+        row = market.item(s, lid)
+        if row is None:
+            raise HTTPException(404, "that product is not for sale")
+        return row
+    finally:
+        s.close()
+
+
 class PaymentIn(BaseModel):
     razorpayOrderId: str
     razorpayPaymentId: str
@@ -2473,5 +2547,280 @@ def assist_continue(body: ContinueIn,
 
         return {"listingId": lst.id, "suggestions": done,
                 "note": "Nothing was saved. Accept the parts you want."}
+    finally:
+        s.close()
+
+
+# ══════════════════════════════════════════════════ transit ops: order lifecycle
+#
+# The tracker, the stage transitions, the packaging video and the exceptions. All of
+# it reads and writes through transit.py, which owns the permission rules - these
+# handlers only turn a refusal into an HTTP status and a sentence.
+
+
+@app.get("/v1/orders/{oid}/timeline")
+def order_timeline(oid: str,
+                   authorization: str | None = Header(None)) -> dict[str, Any]:
+    """
+    One order's whole journey: done, current, upcoming, plus the full event history.
+
+    Readable by anyone party to the order. A guest gets the tracker with
+    `viewerRole: "guest"` and an empty `canAdvanceTo`, because a buyer following a
+    parcel should see where it is without being able to move it.
+    """
+    s = db.session()
+    try:
+        order = s.get(db.Order, oid)
+        if not order:
+            raise HTTPException(404, "no such order")
+        me = auth.artisan_from_token(s, authorization)
+        return transit.timeline(s, order, viewer=me)
+    finally:
+        s.close()
+
+
+class StageIn(BaseModel):
+    stage: str
+    note: str = ""
+    location: str = ""
+
+
+@app.post("/v1/orders/{oid}/stage")
+def order_stage(oid: str, body: StageIn,
+                authorization: str | None = Header(None)) -> dict[str, Any]:
+    """
+    Move an order to the next stage, recorded against the person who did it.
+
+    403 rather than 400 on a permission refusal, because "that stage belongs to the
+    artisan" is a different problem from "that is not a stage" and the app shows them
+    differently.
+    """
+    s = db.session()
+    try:
+        order = s.get(db.Order, oid)
+        if not order:
+            raise HTTPException(404, "no such order")
+        me = _need_artisan(s, authorization)
+        try:
+            out = transit.advance(s, order, body.stage.strip(), artisan=me,
+                                  note=body.note.strip(),
+                                  location=body.location.strip())
+        except ValueError as e:
+            msg = str(e)
+            code = 403 if ("not yours" in msg or "belongs to" in msg
+                           or "not a party" in msg) else 400
+            raise HTTPException(code, msg)
+        s.commit()
+        return {**out, "timeline": transit.timeline(s, order, viewer=me)}
+    finally:
+        s.close()
+
+
+@app.post("/v1/orders/{oid}/packaging-video")
+async def order_packaging_video(
+        oid: str, request: Request,
+        authorization: str | None = Header(None),
+        x_seconds: str | None = Header(None),
+        x_note: str | None = Header(None)) -> dict[str, Any]:
+    """
+    Attach a packaging video to an order.
+
+    The body is the raw video bytes rather than multipart or base64, on purpose. A
+    twenty-second clip off a phone is several megabytes; base64 inflates that by a
+    third and multipart means buffering the whole thing twice. The bytes go to the
+    same bucket the photographs use, through media.save_bytes.
+
+    A size ceiling is enforced here rather than trusted from the client, because the
+    request body is the one number a caller controls completely.
+    """
+    s = db.session()
+    try:
+        order = s.get(db.Order, oid)
+        if not order:
+            raise HTTPException(404, "no such order")
+        me = _need_artisan(s, authorization)
+
+        data = await request.body()
+        if not data:
+            raise HTTPException(400, "no video in the request body")
+        limit = 48 * 1024 * 1024
+        if len(data) > limit:
+            raise HTTPException(
+                413, f"that video is {len(data) // (1024 * 1024)} MB. Keep it under "
+                     f"{limit // (1024 * 1024)} MB - a few seconds of the parcel being "
+                     f"sealed is enough.")
+
+        ctype = (request.headers.get("content-type") or "").split(";")[0].strip()
+        ext = {"video/mp4": ".mp4", "video/quicktime": ".mov",
+               "video/x-m4v": ".m4v"}.get(ctype)
+        if ext is None:
+            ctype, ext = "video/mp4", ".mp4"
+
+        try:
+            seconds = float(x_seconds or 0)
+        except ValueError:
+            seconds = 0.0
+
+        # Named by order and attempt, so a retake does not overwrite the previous
+        # upload. The history keeps every attempt; the tracker shows the latest.
+        attempt = 1 + (s.query(db.Event)
+                       .filter(db.Event.subject_type == "order",
+                               db.Event.subject_id == oid,
+                               db.Event.kind == "packaging_proof").count())
+        name = f"{oid}_packaging_{attempt}{ext}"
+
+        url = media.save_bytes(data, name, ctype)
+        try:
+            out = transit.attach_proof(s, order, artisan=me, url=url,
+                                       note=(x_note or "").strip(), seconds=seconds)
+        except ValueError as e:
+            raise HTTPException(403, str(e))
+        s.commit()
+        log.info("order %s packaging video %s (%d KB)", oid, name, len(data) // 1024)
+        return {**out, "bytes": len(data), "attempt": attempt,
+                "timeline": transit.timeline(s, order, viewer=me)}
+    finally:
+        s.close()
+
+
+class ExceptionIn(BaseModel):
+    type: str
+    description: str = ""
+
+
+@app.post("/v1/orders/{oid}/exception")
+def order_exception(oid: str, body: ExceptionIn,
+                    authorization: str | None = Header(None)) -> dict[str, Any]:
+    """Flag a problem against an order. It appears in the timeline, unresolved."""
+    s = db.session()
+    try:
+        order = s.get(db.Order, oid)
+        if not order:
+            raise HTTPException(404, "no such order")
+        me = _need_artisan(s, authorization)
+        try:
+            out = transit.raise_exception(s, order, artisan=me,
+                                          kind=body.type.strip(),
+                                          description=body.description.strip())
+        except ValueError as e:
+            raise HTTPException(400 if "known exception" in str(e) else 403, str(e))
+        s.commit()
+        return {**out, "timeline": transit.timeline(s, order, viewer=me)}
+    finally:
+        s.close()
+
+
+@app.get("/v1/transit/board")
+def transit_board(authorization: str | None = Header(None)) -> dict[str, Any]:
+    """
+    Stage counts and the order list behind them, for the operations dashboard.
+
+    Scoped to what the caller actually runs: orders on listings sold through a cluster
+    they own, plus their own listings. Not a global view - somebody else's orders are
+    not theirs to count.
+    """
+    s = db.session()
+    try:
+        me = _need_artisan(s, authorization)
+        return transit.board(s, me)
+    finally:
+        s.close()
+
+
+@app.get("/v1/transit/stages")
+def transit_stages() -> dict[str, Any]:
+    """
+    The stage list itself, so the app draws the same journey the server enforces.
+
+    Public and unauthenticated: it is a schema, not data. Shipping it from here rather
+    than hardcoding it in the app is what stops the tracker showing a stage the
+    backend has never heard of.
+    """
+    return {"stages": transit.STAGES, "exceptions": transit.EXCEPTIONS}
+
+
+# ══════════════════════════════════════════════ operations dashboard and reports
+#
+# All of it scoped in dashboard.py to what the caller is actually answerable for:
+# their own listings, plus everything sold through a cluster they own. There is no
+# global view, because somebody else's order book is not theirs to read.
+
+
+@app.get("/v1/dashboard")
+def dashboard_metrics(authorization: str | None = Header(None)) -> dict[str, Any]:
+    """
+    The five headline numbers, each carrying the ids that produced it.
+
+    The ids travel with the number so tapping a card can open exactly those rows,
+    rather than running a second, slightly different query that disagrees with the
+    figure the person just tapped.
+    """
+    s = db.session()
+    try:
+        me = _need_artisan(s, authorization)
+        return dashboard.metrics(s, me)
+    finally:
+        s.close()
+
+
+@app.get("/v1/dashboard/pending-reviews")
+def dashboard_pending(authorization: str | None = Header(None)) -> dict[str, Any]:
+    """Products waiting on a person, split by whether details or publishing is what
+    is missing."""
+    s = db.session()
+    try:
+        me = _need_artisan(s, authorization)
+        return dashboard.pending_reviews(s, me)
+    finally:
+        s.close()
+
+
+@app.get("/v1/dashboard/live-products")
+def dashboard_live(authorization: str | None = Header(None)) -> dict[str, Any]:
+    """What is on sale, grouped by the channel that actually accepted it."""
+    s = db.session()
+    try:
+        me = _need_artisan(s, authorization)
+        return dashboard.live_products(s, me)
+    finally:
+        s.close()
+
+
+@app.get("/v1/dashboard/cluster/{cluster_id}")
+def dashboard_cluster(cluster_id: str,
+                      authorization: str | None = Header(None)) -> dict[str, Any]:
+    """
+    One cluster from its operator's side: listings, orders, splitting tasks, roster.
+
+    403 for anybody but the owner. A cluster's order book carries buyer names and
+    delivery addresses, and being a member of the cluster does not entitle somebody
+    to those.
+    """
+    s = db.session()
+    try:
+        me = _need_artisan(s, authorization)
+        try:
+            return dashboard.cluster_view(s, me, cluster_id)
+        except PermissionError as e:
+            raise HTTPException(403, str(e))
+        except ValueError as e:
+            raise HTTPException(404, str(e))
+    finally:
+        s.close()
+
+
+@app.get("/v1/reports")
+def reports_view(authorization: str | None = Header(None)) -> dict[str, Any]:
+    """
+    Revenue and payouts, with money that arrived kept separate from money that is owed.
+
+    No projections and no growth percentages: there is not enough history here for
+    either to mean anything, and a made-up trend line is the fastest way to lose an
+    artisan's trust in every other number on the screen.
+    """
+    s = db.session()
+    try:
+        me = _need_artisan(s, authorization)
+        return dashboard.reports(s, me)
     finally:
         s.close()

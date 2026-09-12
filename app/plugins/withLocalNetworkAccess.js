@@ -44,6 +44,7 @@ const XML = `<?xml version="1.0" encoding="utf-8"?>
     ${range10()}
     ${range192()}
     ${range172()}
+    ${range100()}
   </domain-config>
 </network-security-config>
 `;
@@ -63,6 +64,22 @@ function range192() {
   }
   return out.join('\n    ');
 }
+// Tailscale hands out addresses in 100.64.0.0/10, the carrier-grade NAT range. It is
+// private space - not routable on the public internet - so permitting cleartext here
+// is the same trade as the three ranges above, and it is what lets the phone reach
+// this laptop from any network at all, mobile data included.
+
+function range100() {
+  const out = [];
+  for (let i = 64; i <= 127; i++) {
+    out.push(`<domain includeSubdomains="true">100.${i}</domain>`);
+  }
+  // fromCharCode rather than an escape: this line was mangled twice by tooling
+  // that eats backslashes, and a broken config plugin fails the Android build
+  // with an error that points nowhere near here.
+  return out.join(String.fromCharCode(10) + '    ');
+}
+
 function range172() {
   const out = [];
   for (let i = 16; i <= 31; i++) out.push(`<domain includeSubdomains="true">172.${i}</domain>`);

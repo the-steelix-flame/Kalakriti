@@ -18,6 +18,14 @@ import ProfileTab from './src/screens/ProfileTab';
 import ProductDetail from './src/screens/ProductDetail';
 import * as drafts from './src/lib/drafts';
 import MarketplaceDetail from './src/screens/MarketplaceDetail';
+import Marketplace from './src/screens/Marketplace';
+import MarketProduct from './src/screens/MarketProduct';
+import OrderTracker from './src/screens/OrderTracker';
+import OpsHeader from './src/screens/OpsHeader';
+import Approvals from './src/screens/Approvals';
+import Reports from './src/screens/Reports';
+import ClusterOps from './src/screens/ClusterOps';
+import TransitBoard from './src/screens/TransitBoard';
 import Enquiries from './src/screens/Enquiries';
 import Clusters from './src/screens/Clusters';
 import ClusterDashboard from './src/screens/ClusterDashboard';
@@ -48,6 +56,21 @@ type Stack =
   | { screen: 'create'; resumeId?: string | null }
   | { screen: 'product'; id: string }
   | { screen: 'marketplace'; id: string; channel: string }
+  // The buyer's shop, its product page, and the tracker for one order. `shop` and
+  // `shopItem` are the customer-facing half of the platform; `track` is shared -
+  // a buyer follows a parcel on it and the artisan moves it along on the same screen,
+  // with the server deciding which of the two they are.
+  | { screen: 'shop' }
+  | { screen: 'shopItem'; id: string }
+  | { screen: 'track'; orderId: string }
+  // One cluster from its operator's side: its listings, its orders and its roster.
+  | { screen: 'clusterOps'; clusterId: string }
+  // The product list. Was a bottom tab; the bar now carries the five operational
+  // sections, so this is pushed from the dashboard instead of being dropped.
+  | { screen: 'products' }
+  // Stage counts across every order this person is answerable for: where the
+  // pile-up is, and which parcels are in it.
+  | { screen: 'board' }
   | { screen: 'enquiries' }
   | { screen: 'clusters' }
   | { screen: 'clusterAdmin' }
@@ -115,6 +138,34 @@ function AppInner() {
   const { t } = useI18n();
   const [onboarded, setOnboarded] = useState(false);
   const [tab, setTab] = useState<TabKey>('home');
+
+  /* ── operations dashboard ──────────────────────────────────────────────────
+   *
+   * Fetched here rather than inside HomeTab so every metric tile can navigate: the
+   * navigator owns the stack, and a tile that cannot move you somewhere is just a
+   * number on a card. Refetched whenever the store refreshes, so publishing a product
+   * on the Approvals tab is reflected in "Pending reviews" without a restart.
+   */
+  const [ops, setOps] = useState<api.DashboardMetrics | null>(null);
+  const [opsLoading, setOpsLoading] = useState(false);
+
+  const loadOps = React.useCallback(async () => {
+    if (!store.artisan) { setOps(null); return; }
+    setOpsLoading(true);
+    try {
+      setOps(await api.dashboard());
+    } catch {
+      // Signed out, offline, or the endpoint is unreachable. The tiles then show a
+      // dash rather than a zero, which is the honest thing for a number we do not
+      // have - and the rest of Home still works.
+      setOps(null);
+    } finally {
+      setOpsLoading(false);
+    }
+  }, [store.artisan]);
+
+  useEffect(() => { void loadOps(); }, [loadOps]);
+
   const [stack, setStack] = useState<Stack>({ screen: 'tabs' });
   const [authOpen, setAuthOpen] = useState(false);
   const [langOpen, setLangOpen] = useState(false);
@@ -215,7 +266,8 @@ function AppInner() {
       <StatusBar style="dark" />
       <View style={{ flex: 1, backgroundColor: C.bg }}>
         {stack.screen === 'create' ? (
-          <Create resumeId={stack.resumeId ?? null} onHome={backToTabs} />
+          <Create resumeId={stack.resumeId ?? null} onHome={backToTabs}
+                  onClusters={() => setStack({ screen: 'clusters' })} />
         ) : stack.screen === 'product' ? (
           <ProductDetail
             listingId={stack.id}
@@ -231,6 +283,42 @@ function AppInner() {
             channel={stack.channel}
             onBack={() => setStack({ screen: 'product', id: stack.id })}
           />
+        ) : stack.screen === 'shop' ? (
+          <Marketplace
+            onBack={backToTabs}
+            onOpen={(id) => setStack({ screen: 'shopItem', id })}
+          />
+        ) : stack.screen === 'shopItem' ? (
+          <MarketProduct
+            id={stack.id}
+            onBack={() => setStack({ screen: 'shop' })}
+            onOrdered={(orderId) => setStack({ screen: 'track', orderId })}
+          />
+        ) : stack.screen === 'track' ? (
+          <OrderTracker orderId={stack.orderId} onBack={backToTabs} />
+        ) : stack.screen === 'board' ? (
+          <TransitBoard
+            onBack={backToTabs}
+            onTrack={(orderId) => setStack({ screen: 'track', orderId })}
+          />
+        ) : stack.screen === 'products' ? (
+          <ProductsTab
+            cards={store.cards}
+            loading={store.loading}
+            offline={store.offline}
+            lastSync={store.lastSync}
+            onOpen={openProduct}
+            onLanguage={openLang}
+            onRefresh={store.refresh}
+            onDelete={askDeleteDraft}
+          />
+        ) : stack.screen === 'clusterOps' ? (
+          <ClusterOps
+            clusterId={stack.clusterId}
+            onBack={() => setStack({ screen: 'clusters' })}
+            onOpenProduct={(id) => setStack({ screen: 'product', id })}
+            onTrack={(orderId) => setStack({ screen: 'track', orderId })}
+          />
         ) : stack.screen === 'enquiries' ? (
           <Enquiries
             enquiries={store.enquiries}
@@ -243,6 +331,7 @@ function AppInner() {
             onBack={backToTabs}
             onLanguage={openLang}
             onChanged={() => store.refresh()}
+            onOpenOps={(clusterId) => setStack({ screen: 'clusterOps', clusterId })}
           />
         ) : stack.screen === 'clusterAdmin' ? (
           <ClusterDashboard
@@ -280,23 +369,42 @@ function AppInner() {
                   onEnquiries={() => setStack({ screen: 'enquiries' })}
                   onClusters={() => setStack({ screen: 'clusters' })}
                   onClusterAdmin={() => setStack({ screen: 'clusterAdmin' })}
+                  onShop={() => setStack({ screen: 'shop' })}
+                  onProducts={() => setStack({ screen: 'products' })}
+                  ops={store.artisan ? (
+                    <OpsHeader
+                      metrics={ops}
+                      loading={opsLoading}
+                      // Pending reviews and Listing Reviews are the same queue, so
+                      // they lead to the same place rather than to two screens that
+                      // would have to be kept in agreement.
+                      onPendingReviews={() => setTab('approvals')}
+                      onLiveProducts={() => setStack({ screen: 'shop' })}
+                      onActiveOrders={() => setStack({ screen: 'board' })}
+                      onPayouts={() => setTab('reports')}
+                      onRevenue={() => setTab('reports')}
+                      onBulkSplitting={() => setStack({ screen: 'enquiries' })}
+                      // The roster lives inside a cluster, because capacity belongs to
+                      // the cluster that is promising it. With one cluster we go
+                      // straight in; with several the list comes first.
+                      onRoster={() => setStack({ screen: 'clusters' })}
+                      onClusters={() => setStack({ screen: 'clusters' })}
+                    />
+                  ) : null}
                   onLogin={() => setAuthOpen(true)}
                   onLanguage={openLang}
                   onTab={setTab}
                   onRefresh={() => { store.refresh(); store.refreshOrders(); }}
                 />
               )}
-              {tab === 'products' && (
-                <ProductsTab
-                  cards={store.cards}
-                  loading={store.loading}
-                  offline={store.offline}
-                  lastSync={store.lastSync}
-                  onOpen={openProduct}
+              {tab === 'approvals' && (
+                <Approvals
                   onLanguage={openLang}
-                  onRefresh={store.refresh}
-                  onDelete={askDeleteDraft}
+                  onOpen={(id) => setStack({ screen: 'create', resumeId: id })}
                 />
+              )}
+              {tab === 'reports' && (
+                <Reports onLanguage={openLang} onOrders={() => setTab('orders')} />
               )}
               {tab === 'orders' && (
                 <OrdersTab
@@ -308,6 +416,8 @@ function AppInner() {
                   onRefresh={store.refreshOrders}
                   onLogin={() => setAuthOpen(true)}
                   onOpenProduct={openProduct}
+                  onTrack={(orderId) => setStack({ screen: 'track', orderId })}
+                  onBoard={() => setStack({ screen: 'board' })}
                   onShip={async (id) => {
                     try { await api.shipOrder(id); } catch { /* surfaced on refresh */ }
                     await store.refreshOrders();

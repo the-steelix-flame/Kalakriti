@@ -95,6 +95,10 @@ export type Listing = {
   vision: any; ocr: { boxes?: OcrBox[]; text?: string };
   transcript: string; status: string;
   channelsSelected: string[];
+  /** Which cluster sells this product, or '' for the artisan's own storefront. The
+   *  cluster owner is the seller of record - they hold the GSTIN - so this is the
+   *  link that lets an artisan without GST reach a marketplace at all. */
+  clusterId?: string;
   artisanId?: string | null;
   weightG?: number; lengthCm?: number; breadthCm?: number; heightCm?: number;
   publications: Publication[];
@@ -666,3 +670,367 @@ export const setPassword = (password: string) =>
 export const deleteListing = (id: string) =>
   call<{ ok: boolean; id: string; title: string }>(
     `/v1/listings/${id}`, { method: 'DELETE' });
+
+/* ═══════════════════════════════════════════════ marketplace (the buyer's side)
+ *
+ * The shop the buyer sees. These endpoints are deliberately unauthenticated: a buyer
+ * browsing has no account, and the server-rendered storefront at /l/{id} has always
+ * been public, so nothing new is exposed by reading the same rows as JSON.
+ *
+ * Nothing here is a second source of truth. `/v1/market` is the same query that draws
+ * the web shop, so a product that has sold out or lost its photograph disappears from
+ * both at once rather than only from one.
+ */
+
+export type MarketItem = {
+  id: string;
+  title: string;
+  titleHi: string;
+  price: number;
+  currency: string;
+  imageUrl: string;
+  category: string;
+  quantity: number;
+  maker: string;
+  makerCluster: string;
+  url: string;
+};
+
+export type MarketDetail = MarketItem & {
+  description: string;
+  descriptionHi: string;
+  hsn: string;
+  /** Who the buyer is actually paying: a cluster owner holds the GSTIN, or the
+   *  artisan herself when there is no cluster. `maker` is always the maker. */
+  seller: string;
+  sellerKind: 'cluster' | 'artisan' | '';
+  weightG: number;
+  dimensionsCm: { length: number; breadth: number; height: number };
+  passportId: string;
+};
+
+/** Everything currently for sale. Drafts, sold-out rows and rows without a
+ *  photograph are excluded by the server, not filtered here. */
+export const market = (q = '', category = '') => {
+  const p = new URLSearchParams();
+  if (q.trim()) p.set('q', q.trim());
+  if (category) p.set('category', category);
+  const qs = p.toString();
+  return get<{ items: MarketItem[]; categories: string[]; testMode: boolean }>(
+    `/v1/market${qs ? `?${qs}` : ''}`);
+};
+
+/** One product, with the description and seller a buyer needs before spending. */
+export const marketItem = (id: string) => get<MarketDetail>(`/v1/market/${id}`);
+
+/**
+ * Place an order.
+ *
+ * The server checks stock and decrements it inside the same transaction that writes
+ * the order row, so two buyers racing for the last pot cannot both win. The app does
+ * not pre-reserve anything and must not assume success: a 400 here means the stock
+ * went while the buyer was typing their address, which is a real answer to show them.
+ */
+export const placeOrder = (b: {
+  listingId: string; buyerName: string; buyerPhone: string;
+  address: string; quantity: number; buyerEmail?: string;
+}) => post<Order & {
+  /** Razorpay's own order id and the publishable key, present only when Razorpay is
+   *  configured. The secret never leaves the server. */
+  razorpayOrderId?: string;
+  razorpayKeyId?: string;
+  /** A UPI intent link, which needs no payment API at all - only the artisan's VPA.
+   *  Present when Razorpay is not configured, so there is always a way to pay. */
+  payLink?: string;
+}>('/v1/orders', b);
+
+/* ═══════════════════════════════════════════════════ transit ops: order journey
+ *
+ * The stage list comes from the server (`transitStages`) rather than being repeated
+ * here. Hardcoding it in the app is how a tracker ends up drawing a stage the backend
+ * has never heard of, or missing one it enforces.
+ */
+
+export type TransitStep = {
+  key: string;
+  label: string;
+  actor: 'system' | 'ops' | 'artisan';
+  state: 'done' | 'current' | 'upcoming';
+  at: string | null;
+  by: string;
+  role: string;
+  note: string;
+  location: string;
+  mediaUrl: string;
+};
+
+export type TransitEvent = {
+  kind: string;
+  from: string; to: string;
+  detail: string;
+  at: string | null;
+  by: string;
+  role: string;
+  mediaUrl: string;
+};
+
+export type Timeline = {
+  orderId: string;
+  stage: string;
+  stageLabel: string;
+  cancelled: boolean;
+  steps: TransitStep[];
+  history: TransitEvent[];
+  packagingVideoUrl: string;
+  exceptions: { type: string; description: string; by: string; at: string | null;
+                mediaUrl: string }[];
+  /** What the signed-in person is on THIS order, not globally. The same account is
+   *  the maker on one order and operations on another. */
+  viewerRole: 'artisan' | 'ops' | 'solo' | 'guest';
+  /** The one stage this viewer may move the order to next, or empty. Only ever one:
+   *  offering every reachable stage would let the artisan skip steps and the tracker
+   *  would then claim stages that never happened. */
+  canAdvanceTo: string[];
+  product: { listingId: string; title: string; imageUrl: string };
+  artisan: { id: string; name: string };
+  quantity: number;
+  amount: number;
+  buyerName: string;
+  updatedAt: string | null;
+};
+
+/** The journey of one order. Readable by any party to it, including a buyer. */
+export const timeline = (orderId: string) =>
+  get<Timeline>(`/v1/orders/${orderId}/timeline`);
+
+/** Move an order forward. The server refuses a stage that is not this role's to
+ *  enter, with a sentence saying whose it is. */
+export const advanceOrder = (orderId: string, stage: string,
+                             b?: { note?: string; location?: string }) =>
+  post<{ orderId: string; stage: string; role: string; timeline: Timeline }>(
+    `/v1/orders/${orderId}/stage`,
+    { stage, note: b?.note || '', location: b?.location || '' });
+
+/** Flag a problem against an order without moving its stage. */
+export const orderException = (orderId: string, type: string, description = '') =>
+  post<{ orderId: string; exception: string; timeline: Timeline }>(
+    `/v1/orders/${orderId}/exception`, { type, description });
+
+/** Stage counts and the orders behind them, scoped to what this person runs. */
+export const transitBoard = () =>
+  get<{
+    stages: { key: string; label: string; actor: string; count: number }[];
+    cancelled: number;
+    orders: { orderId: string; stage: string; stageLabel: string; title: string;
+              imageUrl: string; quantity: number; amount: number;
+              buyerName: string; at: string | null }[];
+    total: number;
+  }>('/v1/transit/board');
+
+/** The stage list the server enforces, so the app draws the same journey. */
+export const transitStages = () =>
+  get<{ stages: { key: string; label: string; actor: string }[];
+        exceptions: string[] }>('/v1/transit/stages');
+
+/**
+ * Send a recorded packaging video up.
+ *
+ * Streamed from the file rather than read into JavaScript first. A twenty-second clip
+ * off a phone is several megabytes; base64 would inflate it by a third and holding it
+ * in memory on a cheap phone risks the very crash this evidence exists to survive.
+ * `uploadAsync` with BINARY_CONTENT hands the file to the platform's networking layer,
+ * which streams it as the raw request body - which is what the endpoint reads.
+ *
+ * Not routed through `call` above, because that helper serialises JSON bodies and
+ * this one must not touch the bytes. The auth header and base URL are taken from the
+ * same places `call` takes them, so there is still one source for both.
+ */
+export async function uploadPackagingVideo(
+  orderId: string, fileUri: string,
+  opts?: { seconds?: number; note?: string },
+): Promise<{ orderId: string; mediaUrl: string; attempt: number; timeline: Timeline }> {
+  if (!hasBackend()) throw new OfflineError();
+  const FileSystem = await import('expo-file-system/legacy');
+  const token = session.getToken();
+
+  const res = await FileSystem.uploadAsync(
+    `${apiBase()}/v1/orders/${orderId}/packaging-video`,
+    fileUri,
+    {
+      httpMethod: 'POST',
+      uploadType: FileSystem.FileSystemUploadType.BINARY_CONTENT,
+      headers: {
+        'Content-Type': 'video/mp4',
+        'X-Guest-Token': session.guestToken(),
+        'X-Seconds': String(Math.round(opts?.seconds || 0)),
+        'X-Note': opts?.note || '',
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      },
+    },
+  );
+
+  let json: any = {};
+  try { json = res.body ? JSON.parse(res.body) : {}; } catch { json = { detail: res.body }; }
+  if (res.status < 200 || res.status >= 300) {
+    const d = json?.detail;
+    throw new ApiError(res.status, d,
+                       typeof d === 'string' ? d : (d?.message || `HTTP ${res.status}`));
+  }
+  return json;
+}
+
+/* ═════════════════════════════════════════ operations dashboard and reports
+ *
+ * Scoped by the server to what the caller is answerable for: their own listings, plus
+ * everything sold through a cluster they own. There is no global view to ask for.
+ *
+ * Every metric carries the ids behind it, so a tapped card opens exactly the rows that
+ * produced the number instead of running a second query that might not agree with it.
+ */
+
+/** A dashboard number the server is willing to stand behind. Distinct from the
+ *  `Metric` above, which describes what a marketplace shares about a listing;
+ *  this one describes our own rows and carries the ids behind the figure.
+ *
+ *  A number the server is willing to stand behind, or an explicit refusal to guess.
+ *  `available: false` with a `why` is not an error - it is the honest answer when a
+ *  figure has never been computed, which is a different thing from it being zero. */
+export type DashMetric = {
+  value: number | null;
+  available: boolean;
+  why?: string;
+  ids?: string[];
+  count?: number;
+};
+
+export type DashboardMetrics = {
+  pendingReviews: DashMetric;
+  liveProducts: DashMetric;
+  activeOrders: DashMetric;
+  pendingPayouts: DashMetric;
+  totalRevenue: DashMetric;
+  clustersOwned: number;
+  /** True when this person runs at least one cluster, which is what turns the
+   *  dashboard from "my work" into "the work I coordinate". */
+  isOperator: boolean;
+};
+
+export type DashCard = {
+  id: string;
+  title: string;
+  imageUrl: string;
+  price: number;
+  quantity: number;
+  status: string;
+  clusterId: string;
+  /** Channels that actually accepted it, from the publications table - not channels
+   *  we intended to send it to. */
+  channels: string[];
+  updatedAt: string | null;
+  missing?: string[];
+};
+
+export const dashboard = () => get<DashboardMetrics>('/v1/dashboard');
+
+export const dashPendingReviews = () =>
+  get<{ needsDetails: DashCard[]; readyToPublish: DashCard[]; total: number }>(
+    '/v1/dashboard/pending-reviews');
+
+export const dashLiveProducts = () =>
+  get<{
+    all: DashCard[]; storefront: DashCard[];
+    byChannel: Record<string, DashCard[]>; channels: string[]; total: number;
+  }>('/v1/dashboard/live-products');
+
+export type ClusterOrderRow = {
+  orderId: string; stage: string; stageLabel: string;
+  title: string; imageUrl: string; quantity: number; amount: number;
+  buyerName: string; paymentStatus: string; at: string | null;
+};
+
+export type SplittingTask = {
+  id: string; buyer: string; organisation: string; quantity: number;
+  targetPrice: number; neededBy: string; status: string; message: string;
+  at: string | null;
+};
+
+export type RosterMember = {
+  artisanId: string; name: string; phone: string; role: string;
+  capacityUnits: number; capacityCommitted: number; capacityAvailable: number;
+  joinedAt: string | null;
+};
+
+export type ClusterView = {
+  cluster: { id: string; name: string; craftCategory: string; district: string;
+             state: string; commissionPct: number; memberCount: number };
+  listings: { all: DashCard[]; pendingReviews: DashCard[];
+              byChannel: Record<string, DashCard[]>; channels: string[];
+              total: number };
+  orders: { active: ClusterOrderRow[]; all: ClusterOrderRow[];
+            splittingTasks: SplittingTask[]; total: number };
+  roster: RosterMember[];
+};
+
+/** One cluster from its operator's side. 403 for anybody but the owner. */
+export const clusterView = (id: string) =>
+  get<ClusterView>(`/v1/dashboard/cluster/${id}`);
+
+export type Reports = {
+  revenue: {
+    paidOrders: number; gross: number;
+    byChannel: Record<string, { orders: number; amount: number }>;
+    unpaidOrders: number; why: string;
+  };
+  payouts: {
+    available: boolean; settlements: number; paid: number; pending: number;
+    rows: { id: string; orderId: string; gross: number; commission: number;
+            distributable: number; status: string; at: string | null }[];
+    why: string;
+  };
+  products: { total: number; live: number };
+};
+
+export const reports = () => get<Reports>('/v1/reports');
+
+/**
+ * Rewrite a server-generated absolute URL onto the backend the app can actually reach.
+ *
+ * The backend stamps its own `PUBLIC_BASE_URL` into every link it hands out: the
+ * storefront page for a listing, the provenance passport, a marketplace permalink.
+ * That value is one fixed address, and on a network that isolates its clients it is
+ * not the address this phone can use. The symptom is a link inside the app opening the
+ * browser on `ERR_ADDRESS_UNREACHABLE` while the app itself is working perfectly,
+ * because the app resolved a different candidate at startup and the link did not.
+ *
+ * So the origin is replaced with whichever candidate `resolve()` actually got an
+ * answer from, and the path is kept exactly as the server wrote it. Anything that is
+ * not one of our own links - a `tel:` number, a UPI intent, a courier's tracking page,
+ * a Supabase image - is returned untouched, because rewriting those would break them.
+ */
+export function localise(url: string): string {
+  if (!url) return url;
+  const base = apiBase();
+  if (!base) return url;
+  try {
+    const target = new URL(url);
+    if (target.protocol !== 'http:' && target.protocol !== 'https:') return url;
+
+    const mine = new URL(base);
+    if (target.host === mine.host) return url;      // already the right one
+
+    // Only rewrite links that came from a Kalakriti backend. Every candidate this app
+    // is built with is one of ours, so the host being in that list is the test - and
+    // a Supabase image or a Razorpay page will never match it.
+    const ours = (process.env.EXPO_PUBLIC_API_URL || '')
+      .split(',')
+      .map((s: string) => s.trim().replace(/\/+$/, ''))
+      .filter(Boolean)
+      .map((s: string) => { try { return new URL(s).host; } catch { return ''; } })
+      .filter(Boolean);
+    if (!ours.includes(target.host)) return url;
+
+    return `${mine.origin}${target.pathname}${target.search}${target.hash}`;
+  } catch {
+    return url;
+  }
+}

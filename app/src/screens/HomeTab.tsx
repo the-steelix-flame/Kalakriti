@@ -27,6 +27,7 @@ import {
 import { TabScreen } from '../nav/Shell';
 import { JobList } from '../ui/JobCard';
 import { useI18n } from '../i18n';
+import OpsHeader from './OpsHeader';
 import { ago } from '../lib/ago';
 import * as api from '../lib/api';
 import * as session from '../lib/session';
@@ -77,7 +78,7 @@ function QuickAction({ icon, label, onPress }: {
 export default function HomeTab({
   artisan, summary, insights, loading, jobs, onDismissJob,
   onNew, onOpenProduct, onResumeDraft,
-  onEnquiries, onClusters, onClusterAdmin,
+  onEnquiries, onClusters, onClusterAdmin, onShop, onProducts, ops,
   onLogin, onLanguage, onTab, onRefresh,
 }: {
   jobs: api.Job[];
@@ -91,10 +92,20 @@ export default function HomeTab({
   onResumeDraft: (id: string) => void;
   onEnquiries: () => void;
   onClusters: () => void;
+  /** Opens the buyer-facing shop. Optional so an older caller still compiles. */
+  onShop?: () => void;
+  /** Opens the product list. It used to be a bottom tab; the bar now carries the five
+   *  operational sections, so the list is pushed from here instead of being dropped. */
+  onProducts?: () => void;
+  /** The operations dashboard block: the five metrics and the four shortcuts. Passed
+   *  in rather than fetched here so the tab stays a presentation layer and the
+   *  navigation targets live where the navigator is. */
+  ops?: React.ReactNode;
   onClusterAdmin: () => void;
   onLogin: () => void;
   onLanguage: () => void;
-  onTab: (t: 'products' | 'orders') => void;
+  /** Switches bottom tab. 'products' is no longer one of them - see onProducts. */
+  onTab: (t: 'orders' | 'approvals' | 'reports') => void;
   onRefresh: () => void;
 }) {
   const { t } = useI18n();
@@ -119,6 +130,11 @@ export default function HomeTab({
       refreshControl={<RefreshControl refreshing={loading} onRefresh={onRefresh}
                                       tintColor={C.primary} />}
     >
+      {/* The operations view goes first: it answers "what needs a decision today",
+          which is the question somebody opening the app is actually holding. The
+          artisan's own work follows underneath, unchanged. */}
+      {ops}
+
       <Btn label={t('home.addProduct')} sub={t('home.addProductSub')}
            icon={<Plus color={C.white} size={26} />} onPress={onNew} large />
 
@@ -254,7 +270,8 @@ export default function HomeTab({
       <Text style={T.section}>{t('home.quickActions')}</Text>
       <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: S.sm }}>
         <QuickAction icon={<Tag color={C.ink} size={18} />}
-                     label={t('home.viewProducts')} onPress={() => onTab('products')} />
+                     label={t('home.viewProducts')}
+                     onPress={() => onProducts?.()} />
         <QuickAction icon={<Rupee color={C.money} size={18} />}
                      label={t('home.viewOrders')} onPress={() => onTab('orders')} />
         <QuickAction icon={<Users color={C.indigo} size={18} />}
@@ -272,10 +289,17 @@ export default function HomeTab({
           <QuickAction icon={<Users color={C.primary} size={18} />}
                        label={t('clu.title')} onPress={onClusters} />
         )}
+        {/* The shop, from the seller's side of the app. Worth a primary action: it
+            is how she checks that her product actually looks right to a buyer, which
+            is not something the seller screens can show her. */}
+        {onShop ? (
+          <QuickAction icon={<Globe color={C.indigoDeep} size={18} />}
+                       label={t('home.viewShop')} onPress={onShop} />
+        ) : null}
         {p?.drafts ? (
           <QuickAction icon={<Camera color={C.inkSoft} size={18} />}
                        label={t('home.continueDraft')}
-                       onPress={() => onTab('products')} />
+                       onPress={() => onProducts?.()} />
         ) : null}
       </View>
 

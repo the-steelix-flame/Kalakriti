@@ -63,17 +63,31 @@ def _prewarm() -> None:
     trade.
     """
     try:
+        # Whatever imaging.py is configured to use, not a hardcoded name. Warming a
+        # different model from the one that serves requests would download 176 MB to
+        # no purpose and leave the real one cold.
+        from imaging import LOCAL_VISION, MODEL
+
+        # And nothing at all when the models are switched off. This call reaches
+        # rembg directly rather than through imaging._rembg_session(), so it does not
+        # inherit that function's guard - without this check a 512 MB host would
+        # download 176 MB and load it at startup, which is the exact thing
+        # LOCAL_VISION=off exists to prevent.
+        if not LOCAL_VISION:
+            log.info("LOCAL_VISION=off - not pre-fetching any matting model")
+            return
+
         # Top-level, not rembg.sessions - that submodule exports the session
         # classes, not the factory, and getting it wrong fails silently
         # behind the except below.
         from rembg import new_session
 
-        log.info("pre-fetching u2net weights…")
-        new_session("u2net")
-        log.info("u2net ready")
+        log.info("pre-fetching matting weights (%s)…", MODEL)
+        new_session(MODEL)
+        log.info("%s ready", MODEL)
     except Exception as exc:                                 # noqa: BLE001
-        log.warning("could not pre-fetch u2net (%s); it will download on first use",
-                    exc)
+        log.warning("could not pre-fetch the matting model (%s); it will download on "
+                    "first use", exc)
 
 
 def main() -> None:

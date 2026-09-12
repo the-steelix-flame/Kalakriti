@@ -694,6 +694,55 @@ def check_logistics() -> None:
                "\n".join(a["missing"]))
 
 
+def check_local_vision() -> None:
+    """
+    Which image work this host can do, and whether that fits the memory it has.
+
+    This exists because the answer used to be invisible. A container on a 512 MB plan
+    with the models enabled does not report an error - it is OOM-killed on the first
+    photograph, and the only symptom is a restart. So the setting is reported here,
+    beside the memory it implies, rather than discovered from a restart loop.
+    """
+    title = "9. Local image models"
+    try:
+        import imaging                                  # noqa: PLC0415
+    except Exception as e:                              # noqa: BLE001
+        report(FAIL, title, f"cannot import imaging: {type(e).__name__}: {str(e)[:160]}")
+        return
+
+    # Measured, whole app plus one real matte of a 3072x4080 phone photo. Not
+    # estimated: the estimate that preceded these numbers was wrong by 200 MB and
+    # recommended a paid plan that had the same memory as the free one.
+    peak = {"u2net": 729, "u2netp": 544}.get(imaging.MODEL)
+
+    if not imaging.LOCAL_VISION:
+        report(PASS, title,
+               "LOCAL_VISION=off. Background removal and offline OCR report themselves "
+               "unavailable instead of loading, and the process settles near 227 MB, "
+               "which fits a 512 MB container.\n"
+               "Unaffected, because they are remote: the listing copy, the price band, "
+               "the HSN code, the translations, and the vision model that reads the "
+               "photograph.\n"
+               "A photograph is kept as taken rather than cut out. The operations log "
+               "records that, so a passport does not claim an edit that never happened.")
+        return
+
+    detail = (f"model {imaging.MODEL}, working resolution capped at "
+              f"{imaging.MATTE_MAX_PX or 'uncapped'}")
+    if peak:
+        detail += (f"\nMeasured peak for this configuration: {peak} MB. A 512 MB "
+                   f"container - Render free and Render starter are both 512 MB - is "
+                   f"OOM-killed on the first photograph, and the symptom is a restart "
+                   f"rather than an error anybody can read. Set LOCAL_VISION=off, or "
+                   f"use a plan with 2 GB.")
+
+    # A warning rather than a failure even under --production, because the memory the
+    # host actually has is not something this process can see. On a 2 GB box this
+    # configuration is correct and is the better one.
+    report(WARN if peak and peak > 512 else PASS, title,
+           "LOCAL_VISION is on, so background removal and offline OCR run locally.",
+           detail)
+
 # ---------------------------------------------------------------------- main
 
 # --------------------------------------------------- 6b. demo accounts
@@ -852,7 +901,8 @@ def main() -> int:
 
     for check in (check_llm, check_database, check_storage, check_public_base_url,
                   check_secrets, check_otp, check_demo_accounts, check_channels,
-                  check_logistics, check_requirements_in_step):
+                  check_logistics, check_local_vision,
+                  check_requirements_in_step):
         try:
             check()
         except Exception as e:                          # noqa: BLE001

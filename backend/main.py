@@ -99,10 +99,8 @@ def _db_kind() -> dict:
     nothing announces it. Somebody discovers it when a seller cannot log in.
     """
     h = db.health()
-    hosted = bool(os.getenv("RENDER") or os.getenv("FLY_APP_NAME")
-                  or os.getenv("RAILWAY_ENVIRONMENT"))
     warning = ""
-    if h.get("engine") == "sqlite" and hosted:
+    if h.get("engine") == "sqlite" and media.hosted():
         warning = ("SQLite on a hosted container sits on an ephemeral disk. Every "
                    "account, listing and order is lost on the next deploy. Set "
                    "DATABASE_URL to a Postgres connection string.")
@@ -154,8 +152,10 @@ def health() -> dict[str, Any]:
         "llm": "nemotron-3-ultra" if llm.available() else "not configured",
         "model": llm.MODEL,
         "vlm": vision.VLM_MODEL if llm.available() else "not configured",
-        "ocr": "rapidocr-onnxruntime (local)",
-        "matting": "rembg/u2net (local)",
+        "ocr": ("rapidocr-onnxruntime (local)" if imaging.LOCAL_VISION
+                else "off (LOCAL_VISION=off - the vision model still reads the photo)"),
+        "matting": (f"rembg/{imaging.MODEL} (local)" if imaging.LOCAL_VISION
+                    else "off (LOCAL_VISION=off - photographs are kept as taken)"),
         "media": media.status(),
         "database": _db_kind(),
         "channels": channels.availability(),

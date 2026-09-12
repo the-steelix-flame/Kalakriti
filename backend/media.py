@@ -129,13 +129,29 @@ def save(img, listing_id: str, kind: str) -> str:
     return f"{PUBLIC_BASE}/media/{name}"
 
 
+def hosted() -> bool:
+    """
+    Are we running on somebody else's container rather than a developer's laptop?
+
+    Each of these is set by the platform itself, not by us, so it cannot be forgotten
+    the way our own flag could be. It decides whether "your data is on an ephemeral
+    disk" is a warning worth showing or just noise on a laptop.
+    """
+    return bool(os.getenv("RENDER") or os.getenv("FLY_APP_NAME")
+                or os.getenv("RAILWAY_ENVIRONMENT"))
+
+
 def status() -> dict:
     """For /health, so a deployment can be checked without uploading a photo."""
+    # The parentheses are the whole point. Written without them - as this was - `and`
+    # binds tighter than `or`, so the condition read `(local and RENDER) or FLY`,
+    # which warned about local storage on Fly even when the bucket was configured,
+    # and never warned on Railway at all.
     return {
         "backend": backend(),
         "missing": missing(),
         "warning": ("Images are on the container filesystem and will be lost on the "
                     "next deploy. Set MEDIA_S3_* for anything but local development.")
-        if backend() == "local" and os.getenv("RENDER") or os.getenv("FLY_APP_NAME")
+        if (backend() == "local" and hosted())
         else "",
     }

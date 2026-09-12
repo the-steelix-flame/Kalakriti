@@ -693,10 +693,21 @@ stopped changing.
   photograph, and nothing raises an error.
 
 **The host**
-- Render from `render.yaml`, on `starter` — not free. The free tier gives 512 MB and
-  `onnxruntime` plus the matting weights plus OCR need roughly 700 MB resident, so a
-  free instance is OOM-killed on the first photograph and the symptom is a restart
-  loop rather than an error message.
+- Render from `render.yaml`, on `free`, with `LOCAL_VISION=off`.
+
+  This paragraph used to say `starter` and cite “roughly 700 MB”, which was reasoned
+  rather than measured. Measured, whole app plus one real matte of a 3072x4080 photo:
+  u2net 729 MB, u2netp 544 MB, u2netp capped at 1600px 519 MB, and `LOCAL_VISION=off`
+  227 MB. Render free and Render starter are *both* 512 MB, so starter would have
+  bought nothing — the recommendation was wrong in a way that cost $7 a month and
+  still would not have worked.
+
+  `LOCAL_VISION=off` is the setting that makes 512 MB viable. It gives up local
+  background removal and offline OCR and nothing else: the listing copy, the pricing,
+  the HSN code, the translations and the vision model that reads the photograph are all
+  on NVIDIA's endpoint. The ops log records that the cut-out did not happen, so the
+  passport does not claim an edit that never took place. `plan: standard`, 2 GB at
+  $25/month, runs the full pipeline.
 - `PUBLIC_BASE_URL` set by hand to the `https://` address Render shows, scheme
   included. Every listing URL, image path and webhook target is built from it.
 

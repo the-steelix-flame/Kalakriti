@@ -51,6 +51,14 @@ _ocr = None
 def _ocr_engine():
     """Lazy - the first call unpacks ~15 MB of ONNX models bundled with the wheel."""
     global _ocr
+    # The same host-level switch imaging.py reads. Off on a container too small to
+    # hold the ONNX models; see the note beside LOCAL_VISION there.
+    from imaging import LOCAL_VISION
+
+    if not LOCAL_VISION:
+        raise RuntimeError(
+            "LOCAL_VISION=off on this host, so local OCR is not available. The "
+            "vision model still reads the photograph; only offline OCR is absent.")
     if _ocr is None:
         from rapidocr_onnxruntime import RapidOCR
 

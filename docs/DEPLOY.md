@@ -98,28 +98,31 @@ here, and `preflight.py` tests both separately for that reason.
 ### 3. The backend - Render (about 3 minutes)
 
 1. **render.com**, then **New** and **Blueprint**, and connect this repository. Render
-   reads `render.yaml` and proposes the service from it.
-2. Because the database is Neon, edit `render.yaml` first: replace the three
-   `fromDatabase` lines under `DATABASE_URL` with `sync: false`, and delete the
-   `databases:` block at the bottom. Otherwise Render creates a Postgres instance
-   that nothing uses and bills for it.
-3. Render prompts for every variable marked `sync: false`. Paste in `NVIDIA_API_KEY`,
-   `DATABASE_URL`, the five `MEDIA_*` values, and the MSG91 pair if you have one.
-   `JWT_SECRET` and `VIEW_SALT` are generated for you.
-4. Deploy. The first build takes five to ten minutes: the image installs onnxruntime
-   and pre-fetches the 176 MB U^2-Net weights so the first artisan to upload a photo
-   does not wait for a download.
-5. When the service is live, copy its `https://...onrender.com` address from the top
-   of the service page and set `PUBLIC_BASE_URL` to it, then redeploy so the value is
-   present at startup.
+   reads `render.yaml` and proposes one web service, `kalakriti-api`, on the free plan
+   in the Singapore region.
+2. Render prompts for every variable marked `sync: false`, which is all of them.
+   Nothing is generated for you, deliberately: `JWT_SECRET`, `VIEW_SALT` and
+   `PASSPORT_PRIVATE_KEY` must match the values your laptop already uses, or the two
+   disagree and every artisan is logged out on the first deploy.
+3. There is no `databases:` block to remove. `DATABASE_URL` is `sync: false` and points
+   at Supabase, or Neon, so Render never creates a Postgres instance to bill for. Use
+   the **session pooler** connection string, port 5432, username
+   `postgres.<project-ref>`, with `?sslmode=require` on the end. The direct string is
+   IPv6-only and Render cannot route to it, which fails as a bare timeout.
+4. Deploy. The first build takes several minutes, mostly installing `onnxruntime` and
+   `opencv`. It does not download the 176 MB U^2-Net weights, because the blueprint
+   builds with `LOCAL_VISION=off`; see the memory section below for why.
+5. When the service is live, copy its `https://...onrender.com` address from the top of
+   the service page and set `PUBLIC_BASE_URL` to it. The service redeploys itself so
+   the value is present at startup.
 
-`PUBLIC_BASE_URL` is a manual step on purpose. Render can inject a service's own
-`host` property, but that is a bare hostname with no `https://`, and this value is
-concatenated straight into listing URLs, storefront links and webhook targets. A URL
-with no scheme is not a URL.
+`PUBLIC_BASE_URL` is a manual step on purpose. Render can inject a service's own `host`
+property, but that is a bare hostname with no `https://`, and this value is concatenated
+straight into listing URLs, storefront links and webhook targets. A URL with no scheme
+is not a URL.
 
-Leave `plan: starter`. See the memory section below for why the free instance does
-not work for this app.
+`plan: free` is what the blueprint ships, and it works because `LOCAL_VISION=off` makes
+the backend fit 512 MB. Read the memory section below before changing either.
 
 ### 4. Check it, rather than assume it
 
@@ -277,79 +280,88 @@ Two things get better the moment the backend is on HTTPS:
 
 ### Memory: the one thing that will bite you
 
-`onnxruntime` + the U²-Net weights + RapidOCR need roughly **700 MB resident**. A
-512 MB free instance is OOM-killed on the first photograph, and the symptom is a
-restart loop rather than an error message.
+This was estimated for a long time and the estimate was wrong in the direction that
+mattered, so here is the measurement. Whole app, plus one real matte of a 3072x4080
+phone photo, resident set size at peak:
 
-There is no environment variable that turns the local models off. Earlier notes in
-this repository mentioned a `HEAVY_VISION` flag; nothing in the code reads it, and
-setting it does nothing at all. Dropping RapidOCR and rembg to fit in 512 MB would be
-a code change - making the imports conditional in `vision.py` and `bg.py` and having
-the pipeline skip those stages - not a setting. It is a reasonable change to make and
-it has not been made.
+| configuration | peak RSS |
+|---|---|
+| `u2net`, the default matting model | 729 MB |
+| `u2netp`, the small one | 544 MB |
+| `u2netp`, working resolution capped at 1600px | 519 MB |
+| `LOCAL_VISION=off` | 227 MB |
 
-So the honest position is: **`plan: starter`, roughly $7/month.** That is the smallest
-instance this runs on as the code stands.
+Render's free and starter plans are both **512 MB**. Nothing that loads a vision model
+fits in that, not even the small model with the resolution capped. Capping the
+resolution was the obvious lever and it bought only 10 to 25 MB, because the cost is
+the ONNX weights and their allocation arenas rather than the image buffers.
 
-### The free host that does have the memory: Hugging Face Spaces
+**There is now a setting that turns the local models off.** Earlier versions of this
+document said there was not, and that making one would be a code change rather than a
+setting. That change has since been made. `LOCAL_VISION=off` makes `imaging.matte` and
+`vision.run_ocr` report themselves unavailable instead of loading anything, and the
+process settles at about 227 MB.
 
-A Docker Space on the free CPU tier gets **2 vCPU and 16 GB of RAM**, which is far
-more than the 700 MB above, and a permanent hostname of the form
-`https://<user>-<space>.hf.space`. That hostname is what makes it worth the slight
-oddness of running an API on a machine-learning demo host: the Provenance Passport QR
-code printed on a finished product encodes `PUBLIC_BASE_URL`, so a disposable tunnel
-hostname means a QR that stops resolving the week after it is printed.
+What that gives up is local background removal and offline OCR, and nothing else.
+Everything on NVIDIA's endpoint is untouched: the listing copy, the price band, the
+HSN code, the translations, and the vision model that reads the photograph are all
+remote calls. A photograph is kept as taken rather than cut out, and the operations
+log that the Provenance Passport signs records that, so a listing made on such a host
+does not claim an edit that never happened.
 
-It sleeps after a long idle period and wakes on the first request, which costs a cold
-start and nothing else. Nothing in the container is persistent, which is exactly why
-Postgres and the image bucket are the two sections above this one.
+Two related settings, both in `backend/imaging.py`:
 
-1. **huggingface.co**, then **New Space**. Choose **Docker** as the SDK and *blank*
-   as the template. Free CPU basic. Make it **public** - a private Space needs a
-   token on every request, and the storefront and passport pages are meant to be
-   opened by a buyer with no account.
-2. The repository already carries what a Space needs: `Dockerfile` at the root, and
-   the YAML front matter at the top of `README.md` that names `sdk: docker` and
-   `app_port: 7860`. Do not delete either; the Space reads them on every build.
-3. Push this repository to the Space:
+- `REMBG_MODEL` picks the matting model, `u2net` by default. `u2netp` is looser around
+  fringes and frayed selvedge, which is exactly where handloom lives, so it is a
+  hosting compromise and not an improvement.
+- `MATTE_MAX_PX` caps the longest edge during matting, 1600 by default. Kept because
+  it is free and bounds the worst case, not because it saves much.
 
-   ```bash
-   git remote add space https://huggingface.co/spaces/<user>/<space>
-   git push space main
-   ```
+So the honest position is one of two, and both are defensible:
 
-   Hugging Face asks for a username and an **access token** as the password. Create
-   one under Settings → Access Tokens with **write** permission.
-4. **Settings → Variables and secrets** on the Space, and add every value from
-   `backend/.env` as a **secret** - `DATABASE_URL`, `NVIDIA_API_KEY`, `JWT_SECRET`,
-   `VIEW_SALT`, the `MEDIA_S3_*` group, the Razorpay keys, the SMS keys. Secrets are
-   injected as environment variables at runtime and are not readable from the repo,
-   which matters because the Space is public.
-5. Set `PUBLIC_BASE_URL` to the Space's own address,
-   `https://<user>-<space>.hf.space`, with no trailing slash. This is the one
-   variable that cannot be filled in before the Space exists, and the one that every
-   storefront link, passport QR code and webhook target is built from.
-6. Watch the build log on the Space page. The first build takes several minutes,
-   mostly `pip install` and the 176 MB U²-Net download. When it finishes, check it
-   the way anything else is checked here:
+- **free plan, `LOCAL_VISION=off`** - which is what `render.yaml` is set up for, and
+  what a demo should use.
+- **`plan: standard`, 2 GB, $25/month** - runs the full pipeline with room to spare.
 
-   ```bash
-   curl https://<user>-<space>.hf.space/health
-   cd backend && PUBLIC_BASE_URL=https://<user>-<space>.hf.space python preflight.py --production
-   ```
+`plan: starter` at $7/month is the one option not worth taking: it has the same 512 MB
+as free, so it buys no capability, only the absence of the idle spin-down.
 
-7. In the app, set the same URL as the backend address in Settings, rebuild the APK,
-   and the QR codes it draws from then on point at a hostname that will still be
-   there next month.
+### Render's free tier: the two limits that catch people
 
-**One thing to know about the filesystem.** The container writes
-`passport_key.pem` - the Ed25519 key that signs Provenance Passports - on first use,
-and that file does not survive a rebuild. A new key is generated and passports minted
-after the rebuild are signed with it. Older passports still verify: each one stores
-the public key that actually signed it, so `/passport/{id}` checks against that rather
-than against whatever key the server holds today. Nothing breaks; it is simply worth
-knowing that "the Kalakriti key" is not one key over time. Mounting persistent storage
-for that one file is the fix when it starts to matter.
+**It spins down after 15 minutes** with no inbound traffic, and the next request waits
+30 to 60 seconds while the container starts. `.github/workflows/keepalive.yml` pings
+`/health` every ten minutes to prevent that.
+
+**It allows 750 instance-hours a month** across every free web service in the account.
+One service held permanently awake uses about 730, a calendar month, so it fits with
+almost nothing spare. A second always-on free service takes the account over the limit
+and Render suspends both.
+
+Full step-by-step instructions for this path, including the values to paste and what
+each failure looks like, are in `DEPLOYING.md` at the repository root.
+
+### A note on Hugging Face Spaces
+
+Earlier versions of this document recommended a free Hugging Face Space, on the
+strength of its 16 GB of RAM on the free CPU tier, which is far more than any figure in
+the table above. That is still true of the hardware, and the path no longer works for
+us in practice, so `DEPLOYING.md` targets Render instead.
+
+The repository still carries everything a Space needs, so the path is recoverable
+rather than deleted: the `Dockerfile`, plus `app.py`, the root `requirements.txt` and
+`packages.txt` for the non-Docker Gradio SDK route, and the YAML front matter at the
+top of `README.md` that selects between them. Render ignores all of it and builds the
+`Dockerfile`.
+
+**One thing to know about the container filesystem, on any of these hosts.** The
+container writes `passport_key.pem`, the Ed25519 key that signs Provenance Passports,
+on first use, and that file does not survive a rebuild. A new key is then generated and
+passports minted afterwards are signed with it. Older passports still verify, because
+each one stores the public key that actually signed it and `/passport/{id}` checks
+against that rather than against whatever key the server holds today. Nothing breaks.
+It is simply worth knowing that "the Kalakriti key" is not one key over time. The fix,
+and the reason `PASSPORT_PRIVATE_KEY` exists as an environment variable, is to set the
+key explicitly so every deploy signs with the same one.
 
 ## 4. Real SMS, so login works for somebody who is not you
 

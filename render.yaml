@@ -1,65 +1,121 @@
-# Render blueprint: a public HTTPS backend, and optionally a managed Postgres,
-# from one file.
+# Render blueprint: one public HTTPS backend, from one file.
 #
-# `render blueprint launch`, or point Render at this repository.
+# Point Render at this repository (New -> Blueprint), or run `render blueprint launch`.
+# Everything marked `sync: false` is deliberately not here - Render prompts for it, or
+# you paste it in the dashboard, and it never reaches the repository.
 #
-# Read the plan lines before deploying. The free web-service tier gives 512 MB of
-# RAM; onnxruntime plus the U^2-Net weights plus RapidOCR need roughly 700 MB
-# resident, so a free instance is OOM-killed on the first photograph and the symptom
-# is a restart loop rather than an error. `starter` is the smallest plan this
-# actually runs on. There is no environment variable that turns the local models off
-# - that would be a code change, not a setting - so the memory line below is not
-# optional.
 #
-# After deploying, run `python preflight.py --production` with these same values in
-# the environment. It checks rather than assumes: it connects to the database, writes
-# and reads back a test object in the bucket, and calls the model endpoint.
+# Read this before choosing a plan
+# --------------------------------
+# Measured, whole app plus one real matte of a 3072x4080 phone photo:
+#
+#     u2net (the default)     729 MB
+#     u2netp (the small one)  544 MB
+#     u2netp, capped 1600     519 MB
+#     LOCAL_VISION=off        227 MB
+#
+# Render's plans, and what each one can actually run:
+#
+#     free       512 MB   needs LOCAL_VISION=off. Spins down after 15 min idle.
+#     starter    512 MB   same memory, so the same limit. Buys no spin-down.
+#     standard     2 GB   runs u2net and OCR with room to spare.
+#
+# So there is no configuration that loads a vision model inside 512 MB, and capping
+# the image resolution barely helped - about 10 to 25 MB - because the cost is the
+# ONNX weights and their arenas, not the picture.
+#
+# This file is set up for **free**, which is the right choice for a demo. What that
+# gives up is local background removal and offline OCR, and nothing else: the listing
+# copy, the pricing, the HSN code, the translations, and the vision model that reads
+# the photograph all run on NVIDIA's endpoint and are unaffected. A photograph is then
+# kept as taken rather than cut out, and the ops log on the Provenance Passport says
+# so rather than implying an edit that never happened.
+#
+# To run the full pipeline: set `plan: standard`, and change both LOCAL_VISION lines
+# below to `on`. Nothing else changes.
+#
+#
+# After the first deploy
+# ----------------------
+#   1. Copy the service's https:// address into PUBLIC_BASE_URL (see the note there).
+#   2. Set BACKEND_URL in GitHub Actions variables, so the keep-alive can reach it.
+#   3. Run `python preflight.py --production` with these same values in the
+#      environment. It checks rather than assumes: it connects to the database, writes
+#      and reads back a test object in the bucket, and calls the model endpoint.
 services:
   - type: web
     name: kalakriti-api
     runtime: docker
     dockerfilePath: ./Dockerfile
-    plan: starter
+    plan: free
+    region: singapore            # nearest to Indian artisans and to Supabase ap-south-1
     healthCheckPath: /health
-    envVars:
-      - key: NVIDIA_API_KEY
-        sync: false                    # set in the dashboard; never in the repo
 
-      # Managed Postgres from the `databases:` block at the bottom of this file.
+    # Passed to `docker build`, not to the running process. This one skips the 176 MB
+    # matting-model download at build time, which is pure waste when the process will
+    # refuse to load it. Keep it in step with the LOCAL_VISION env var below - the ARG
+    # decides what is baked in, the env var decides what runs.
+    dockerBuildArgs:
+      LOCAL_VISION: "off"
+
+    envVars:
+      # See the plan note at the top of this file. This is the setting that makes a
+      # 512 MB box viable; on `standard` set it to `on`.
+      - key: LOCAL_VISION
+        value: "off"
+
+      # The models. Without this key there are no listings at all - the copy, the
+      # price band, the HSN code and the translations are all this endpoint.
+      - key: NVIDIA_API_KEY
+        sync: false
+
+      # Supabase Postgres, via the **session pooler** - port 5432, IPv4, username
+      # `postgres.<project-ref>` - and with `?sslmode=require` on the end. The direct
+      # connection is IPv6-only and Render does not route to it, which fails as a
+      # timeout rather than as anything that mentions IPv6.
       #
-      # To use Neon or Supabase instead - which is what the free path in
-      # docs/DEPLOY.md does - delete these three lines, replace them with
-      # `sync: false`, and paste the connection string in the dashboard. Then delete
-      # the `databases:` block too, or Render will bill for a database nothing uses.
+      # There is deliberately no `databases:` block in this file. Render's own free
+      # Postgres is deleted after 30 days and takes the data with it; the paid tier
+      # costs money for a database Supabase is already providing.
       - key: DATABASE_URL
-        fromDatabase:
-          name: kalakriti-db
-          property: connectionString
+        sync: false
 
       # Deliberately not `fromService: property: host`. That property yields a bare
       # hostname with no scheme - `kalakriti-api.onrender.com` - and this value is
-      # concatenated directly into listing URLs, storefront links, webhook targets
-      # and locally served image paths. A URL with no scheme is not a URL, and every
-      # link built from it is broken.
+      # concatenated straight into listing URLs, storefront links, ONDC callbacks, the
+      # QR code on a passport and locally served image paths. A URL with no scheme is
+      # not a URL, and every link built from it is broken.
       #
       # So it is set by hand, once, after the first deploy: copy the https:// address
-      # shown at the top of the service page in the Render dashboard. Until then
-      # preflight reports it as the failure it is.
+      # at the top of the service page, with no trailing slash. Until then preflight
+      # reports it as the failure it is.
       - key: PUBLIC_BASE_URL
         sync: false
 
-      # Sessions are signed with the first. The second salts the hash that keeps a
-      # storefront view row from identifying the person who made it. Both must be set
-      # here rather than left to the code's fallbacks: auth.py otherwise writes a
-      # generated key to jwt_secret.txt, which lives on the container filesystem and
-      # is therefore replaced on every deploy, silently logging every artisan out.
+      # Three identities that must survive a deploy.
+      #
+      # `generateValue` is wrong for all three, even though it looks tidier: Render
+      # generates once and keeps it, but the values already exist in backend/.env, and
+      # a different value here means the laptop and the server disagree. JWT_SECRET
+      # differing logs every artisan out; PASSPORT_PRIVATE_KEY differing means
+      # passports signed before the deploy no longer verify against the issuer key
+      # served after it, which is exactly the claim a passport exists to make.
+      #
+      # Paste the values from backend/.env. The code's own fallback - writing a
+      # generated key to jwt_secret.txt - is worse here than no key, because the
+      # container filesystem is replaced on every deploy and it would look like it
+      # worked.
       - key: JWT_SECRET
-        generateValue: true
+        sync: false
       - key: VIEW_SALT
-        generateValue: true
+        sync: false
+      - key: PASSPORT_PRIVATE_KEY
+        sync: false
 
-      # Images must not live on the container disk: it is wiped on every deploy, and
-      # a marketplace has already published the image URL by then.
+      # Product photographs. These must not live on the container disk: it is wiped on
+      # every deploy, and a marketplace has already published the image URL by then.
+      # Supabase Storage is S3-compatible, so this needs no account beyond the one the
+      # database is already on.
       - key: MEDIA_S3_ENDPOINT
         sync: false
       - key: MEDIA_S3_BUCKET
@@ -68,32 +124,34 @@ services:
         sync: false
       - key: MEDIA_S3_SECRET
         sync: false
-      # The bucket's public read URL. Without it, image URLs are built from the S3
-      # API endpoint, which requires a signature - on R2 an unsigned browser request
-      # gets 401, so every product photograph is a broken image to a buyer.
+      # Supabase wants a real region name, `ap-south-1` for Mumbai. Cloudflare R2
+      # wants the literal string `auto`. Not a secret either way, but it differs by
+      # provider, so it is not hardcoded here.
+      - key: MEDIA_S3_REGION
+        sync: false
+      # The bucket's public read URL. Without it, image URLs are built from the S3 API
+      # endpoint, which requires a signature - so an unsigned browser request gets a
+      # 401 and every product photograph is a broken image to a buyer.
       - key: MEDIA_PUBLIC_BASE
         sync: false
-      # Not a secret. R2 wants the literal string `auto`; real AWS wants a region
-      # name such as ap-south-1.
-      - key: MEDIA_S3_REGION
-        value: auto
+
+      # Checkout. Test-mode keys are real API credentials against fake money, so they
+      # belong in the dashboard like any other secret.
+      - key: RAZORPAY_KEY_ID
+        sync: false
+      - key: RAZORPAY_KEY_SECRET
+        sync: false
+      - key: RAZORPAY_WEBHOOK_SECRET
+        sync: false
 
       # OTP delivery. Without these the server refuses to send a code rather than
-      # pretending to, which means nobody can log in. OTP_DEV_ECHO is deliberately
-      # absent and must stay absent: it returns the login code in the API response,
-      # so setting it here would hand anybody who can call the endpoint a login for
-      # any phone number.
+      # pretending to, which means nobody can log in by phone - the two seeded
+      # password accounts are the way in until the MSG91 wallet has credit.
+      #
+      # OTP_DEV_ECHO is deliberately absent and must stay absent. It returns the login
+      # code in the API response, so setting it on a public host hands anybody who can
+      # call the endpoint a login for any phone number.
       - key: MSG91_AUTH_KEY
         sync: false
       - key: MSG91_TEMPLATE_ID
         sync: false
-
-# Delete this block if DATABASE_URL points at Neon or Supabase.
-#
-# `basic-256mb` is a paid plan, chosen because Render's free Postgres instance is
-# deleted after 30 days and takes the data with it. If the budget is genuinely zero,
-# the free path in docs/DEPLOY.md uses Neon, whose free tier does not expire.
-databases:
-  - name: kalakriti-db
-    plan: basic-256mb
-    postgresMajorVersion: "16"

@@ -1,47 +1,59 @@
-# Keep the Hugging Face Space awake, and notice when it is not.
+# Keep the Render backend awake, and notice when it is not.
 #
-# A free Docker Space on Hugging Face sleeps after 48 hours with no traffic. Waking
-# it is not instant: the container comes back from the image and the first request
-# waits 30 to 60 seconds while uvicorn starts and the ONNX sessions load. That is the
-# difference between a demo that opens and a demo that spins.
+# A free Render web service spins down after **15 minutes** with no inbound traffic.
+# Waking it is not instant: the container is started from the image and the first
+# request waits 30 to 60 seconds while uvicorn boots. That is the difference between a
+# demo that opens and a demo that spins - and on Render the spin-down is the normal
+# case rather than the rare one, because 15 minutes is shorter than a coffee break.
 #
-# Why every 30 minutes and not every 5
-# ------------------------------------
-# The threshold is 48 hours, so half-hourly is already 96 times more often than it
-# needs to be. Tighter buys nothing and costs real Actions minutes: a 5-minute cron
-# is 8,640 runs a month, which on a private repository eats most of the free
-# 2,000-minute budget for no benefit. Public repositories get unlimited minutes, so
-# on a public repo the interval is free either way - it stays at 30 minutes, because
-# a schedule should be as slow as the thing it protects allows.
+# Why every 10 minutes
+# --------------------
+# The threshold is 15 minutes, so the interval has to be under it with room for the
+# drift described below. Ten minutes gives one spare ping before the window closes.
 #
-# What this does NOT do
-# ---------------------
-# It does not stop a Space restarting on its own, and it cannot make a cold start
-# fast. It stops the *idle* sleep, which is the predictable one.
+# This is not free of consequence and it is worth knowing which consequences are real:
 #
-# Two things worth knowing before trusting it:
+#   - **Actions minutes.** 10-minute cron is about 4,300 runs a month. On a private
+#     repository that would exceed the free 2,000-minute budget. This repository is
+#     public, and public repositories get unlimited Actions minutes, so here it costs
+#     nothing. If it is ever made private, widen this to `*/14` and accept the
+#     occasional cold start, or pay for Render's starter plan, which does not spin
+#     down at all.
+#
+#   - **Render instance hours.** The free tier gives 750 instance-hours a month across
+#     every free web service in the account. Kept permanently awake, one service uses
+#     about 730 - a calendar month - which fits, with almost nothing spare. A *second*
+#     free web service pinged the same way would take the account over the limit and
+#     Render suspends both. One always-on free service is the budget.
+#
+# Two more things worth knowing before trusting this:
 #
 #   - GitHub disables scheduled workflows on a repository with no pushes for 60 days,
 #     and emails the owner. If the pings stop, check that first.
 #   - Cron on shared runners is best-effort and can drift by ten or twenty minutes
-#     under load. Harmless here, but worth knowing before debugging a gap.
+#     under load. A drift past 15 minutes means one cold start, not an outage.
+#
+# What this does NOT do
+# ---------------------
+# It does not stop Render restarting the service for its own reasons, and it cannot
+# make a cold start fast. It stops the *idle* spin-down, which is the predictable one.
 #
 # Setting the URL
 # ---------------
 # Settings -> Secrets and variables -> Actions -> Variables -> New repository
-# variable, named BACKEND_URL, holding the Space address with no trailing slash:
+# variable, named BACKEND_URL, holding the service address with no trailing slash:
 #
-#     https://<user>-<space>.hf.space
+#     https://kalakriti-api.onrender.com
 #
 # A variable rather than a secret, on purpose. The address is public - buyers open
-# storefront links on it - so hiding it would buy nothing and would stop the log
+# storefront links on it - so hiding it would buy nothing, and would stop the log
 # saying which host failed.
 
 name: Keep the backend awake
 
 on:
   schedule:
-    - cron: "*/30 * * * *"
+    - cron: "*/10 * * * *"
   # So it can be run by hand straight after a deploy, without waiting for the cron.
   workflow_dispatch:
 
@@ -67,18 +79,18 @@ jobs:
           if [ -z "${BACKEND_URL:-}" ]; then
             echo "::error::BACKEND_URL is not set."
             echo "Set it under Settings -> Secrets and variables -> Actions ->"
-            echo "Variables, as the Space address with no trailing slash, e.g."
-            echo "  https://your-user-kalakriti.hf.space"
+            echo "Variables, as the service address with no trailing slash, e.g."
+            echo "  https://kalakriti-api.onrender.com"
             exit 1
           fi
 
           URL="${BACKEND_URL%/}/health"
           echo "pinging $URL"
 
-          # Six attempts over roughly three minutes. A sleeping Space answers 503 and
-          # then takes most of a minute to come up, so a single request would report a
-          # perfectly healthy backend as dead every time it had gone to sleep - which
-          # is exactly the case this workflow exists for.
+          # Six attempts over roughly three minutes. A spun-down Render service answers
+          # 502 from its router and then takes most of a minute to come up, so a single
+          # request would report a perfectly healthy backend as dead every time it had
+          # gone to sleep - which is exactly the case this workflow exists for.
           for attempt in 1 2 3 4 5 6; do
             # `|| echo 000` would append to whatever curl already printed, and curl
             # prints 000 of its own when it cannot connect - so a DNS failure read
@@ -90,14 +102,17 @@ jobs:
             if [ "$code" = "200" ]; then
               echo "awake (HTTP 200) on attempt $attempt"
 
-              # Surface a little of what it said, so a Space that is up but
-              # misconfigured - no database, no model key - is visible here rather
-              # than only later in the app. grep rather than a parser: this runs on a
-              # bare runner and a missing field should not fail the ping.
+              # Surface a little of what it said, so a service that is up but
+              # misconfigured - no database, no model key, images on the container
+              # disk - is visible here rather than only later in the app. grep rather
+              # than a parser: this runs on a bare runner and a missing field should
+              # not fail the ping.
               echo "--- /health ---"
               grep -o '"engine":"[^"]*"'  /tmp/health.json || true
               grep -o '"llm":"[^"]*"'     /tmp/health.json || true
               grep -o '"ok":[a-z]*'       /tmp/health.json | head -1 || true
+              # Non-empty means something is wrong in a way the app will feel.
+              grep -o '"warning":"[^"]\+"' /tmp/health.json || true
               exit 0
             fi
 
@@ -108,7 +123,11 @@ jobs:
           # Failing loudly is the point. A silent keep-alive that has been pinging a
           # dead host for a week is worse than none, because it is believed.
           echo "::error::$URL did not answer after 6 attempts over ~3 minutes."
-          echo "Check the Space's build log. The usual causes are a crashed build, a"
-          echo "missing secret (DATABASE_URL, NVIDIA_API_KEY), or the Space having"
-          echo "been paused in its Settings."
+          echo "Check the service's Logs and Events tabs in the Render dashboard."
+          echo "The usual causes, most likely first:"
+          echo "  - out of memory. LOCAL_VISION must be off on a 512 MB plan;"
+          echo "    Events shows 'Out of memory' and the service restart-loops."
+          echo "  - a missing env var (DATABASE_URL, NVIDIA_API_KEY, PUBLIC_BASE_URL)."
+          echo "  - the free tier's 750 instance-hours for the month are spent."
+          echo "  - the service was suspended in its Settings."
           exit 1

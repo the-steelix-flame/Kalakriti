@@ -8,19 +8,73 @@ returns are charged back to the artisan.
 """
 import base64
 import io
+import logging
+import os
 
 from PIL import Image, ImageEnhance, ImageOps
 
+log = logging.getLogger("imaging")
+
 _session = None
+
+# Which U^2-Net variant does the matting. A setting, because it changes what the
+# backend costs to host by a factor of two.
+#
+# The full measurement is in the note beside LOCAL_VISION below. The short version:
+# u2netp saves about 185 MB of resident memory and is looser around hair, fringes and
+# the frayed edge of a woven textile - which is exactly where handloom lives. It is a
+# hosting compromise, not an improvement, so u2net stays the default.
+MODEL = (os.getenv("REMBG_MODEL") or "u2net").strip()
+
+# Longest edge, in pixels, that the matting step works at. 0 disables the cap.
+#
+# See the note in `matte` for why this exists and what it measured. Raise it on a
+# host with memory to spare; the only thing it costs is the crispness of the cut-out
+# edge at very large sizes, and the storefront never displays these that big.
+MATTE_MAX_PX = int(os.getenv("MATTE_MAX_PX") or "1600")
+
+# Are the local vision models available on this host at all?
+#
+# Measured, whole app plus one real matte of a 3072x4080 phone photo:
+#
+#     u2net                 729 MB
+#     u2netp                544 MB
+#     u2netp, capped 1600   519 MB
+#
+# A 512 MB container cannot run any of those - and capping the resolution barely
+# helped, because the cost is the ONNX weights and their arenas, not the image.
+#
+# So a small host can set LOCAL_VISION=off. Background removal and local OCR then
+# report themselves unavailable instead of being loaded, and the process settles at
+# about 110 MB. Everything that runs on NVIDIA's endpoint - the listing copy, the
+# pricing, the HSN code, the translations, and the vision model that reads the
+# photograph - is unaffected, because none of it is local.
+#
+# What is genuinely lost is the cut-out and the studio background, and the offline
+# OCR. The app already records which operations ran, so a listing made on such a host
+# says so rather than implying an edit that never happened.
+LOCAL_VISION = (os.getenv("LOCAL_VISION") or "on").strip().lower() not in (
+    "off", "0", "false", "no")
 
 
 def _rembg_session():
-    """Loaded lazily — the first call downloads ~176 MB of u2net.onnx to ~/.u2net/."""
+    """
+    Loaded lazily, on the first photograph rather than at import.
+
+    Lazily for two reasons: a process that never mattes anything - a worker draining
+    the outbox, a health check - never pays the memory, and the weights download on
+    first use rather than blocking startup.
+    """
     global _session
+    if not LOCAL_VISION:
+        raise RuntimeError(
+            "LOCAL_VISION=off on this host, so background removal is not available. "
+            "The photograph is kept as taken.")
     if _session is None:
         from rembg import new_session
 
-        _session = new_session("u2net")
+        log.info("loading matting model %r", MODEL)
+        _session = new_session(MODEL)
     return _session
 
 
@@ -43,13 +97,36 @@ def matte(data: bytes) -> tuple[Image.Image | None, list[str]]:
     ops: list[str] = []
     src = ImageOps.exif_transpose(Image.open(io.BytesIO(data)).convert("RGB"))
     ops.append(f"decode:{src.width}x{src.height} exif-oriented")
+
+    # Cap the working resolution before matting.
+    #
+    # This was the single largest memory cost in the whole request, and it was
+    # invisible: the full-resolution photograph went straight into rembg, which holds
+    # several RGBA buffers the size of the input. A modern phone shoots 4000x3000, so
+    # one photograph could allocate most of a small container's memory and be
+    # OOM-killed - the symptom being a restart, not an error anybody could read.
+    #
+    # It helps less than it looks like it should - about 10 to 25 MB, because the
+    # cost is dominated by the ONNX weights rather than the picture. Kept anyway: it
+    # is free, it makes matting faster, and it bounds the worst case.
+    #
+    # 1600px on the long edge is far more than a marketplace listing needs - the
+    # storefront renders these a few hundred pixels wide - and U^2-Net resizes its
+    # input to 320x320 internally anyway, so the mask loses nothing that survives to
+    # the output. The downscale is recorded in the ops log, because an edit log that
+    # omits a resize is not an edit log.
+    if MATTE_MAX_PX and max(src.width, src.height) > MATTE_MAX_PX:
+        before = f"{src.width}x{src.height}"
+        src.thumbnail((MATTE_MAX_PX, MATTE_MAX_PX), Image.LANCZOS)
+        ops.append(f"resize:{before} -> {src.width}x{src.height} for matting")
+
     src = _autolevel(src)
     ops.append("exposure:auto-levels +0.06 / saturation +0.04")
     try:
         from rembg import remove
 
         cut = remove(src, session=_rembg_session())
-        ops.append("segment:u2net-matting (rembg, MIT)")
+        ops.append(f"segment:{MODEL}-matting (rembg, MIT)")
         bbox = cut.split()[-1].getbbox()
         if bbox:
             pad = int(0.04 * max(cut.width, cut.height))
@@ -85,7 +162,7 @@ def enhance(data: bytes, size: int = 1400, remove_bg: bool = True) -> tuple[str,
             from rembg import remove
 
             cut = remove(src, session=_rembg_session())  # RGBA with alpha matte
-            ops.append("segment:u2net-matting (rembg, MIT)")
+            ops.append(f"segment:{MODEL}-matting (rembg, MIT)")
 
             # Crop to the subject's own bounding box before flattening. Centring the
             # *image* is not centring the *subject* - a pot shot from three metres away

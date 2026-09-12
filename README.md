@@ -1,3 +1,13 @@
+---
+title: Kalakriti
+emoji: 🧵
+colorFrom: indigo
+colorTo: green
+sdk: docker
+app_port: 7860
+pinned: false
+---
+
 # Kalakriti · कलाकृति
 
 **Craft, and the market it could never reach.**
@@ -52,6 +62,18 @@ app/
   src/screens/         Home, Studio, Catalog, Pricing, Market
   android/             native project from `expo prebuild` - this is what Gradle compiles
 ```
+
+## Just pulled? Start here
+
+`RUNNING.md` gets the whole demo flow working on your own machine - macOS and
+Windows, side by side, including which two accounts to sign in with and why OTP does
+not work yet. Read that before `SETUP.md`, which is the longer reference.
+
+Two things that catch everybody:
+
+- `backend/.env` is not in the repo. Ask in the group for it.
+- The tunnel hostname is compiled into the APK, so you build your own APK and
+  rebuild it whenever your tunnel restarts.
 
 ## Run it
 

@@ -22,6 +22,7 @@ import { Card, Btn, Pill, Skeleton, money } from '../ui';
 import { C, S, T, R } from '../theme';
 import {
   Plus, Camera, Rupee, Globe, Users, Trend, Warning, Tag, Check,
+  Shield,
 } from '../icons';
 import { TabScreen } from '../nav/Shell';
 import { JobList } from '../ui/JobCard';
@@ -76,7 +77,8 @@ function QuickAction({ icon, label, onPress }: {
 export default function HomeTab({
   artisan, summary, insights, loading, jobs, onDismissJob,
   onNew, onOpenProduct, onResumeDraft,
-  onEnquiries, onLogin, onLanguage, onTab, onRefresh,
+  onEnquiries, onClusters, onClusterAdmin,
+  onLogin, onLanguage, onTab, onRefresh,
 }: {
   jobs: api.Job[];
   onDismissJob: (id: string) => void;
@@ -88,6 +90,8 @@ export default function HomeTab({
   onOpenProduct: (id: string) => void;
   onResumeDraft: (id: string) => void;
   onEnquiries: () => void;
+  onClusters: () => void;
+  onClusterAdmin: () => void;
   onLogin: () => void;
   onLanguage: () => void;
   onTab: (t: 'products' | 'orders') => void;
@@ -257,6 +261,17 @@ export default function HomeTab({
                      label={`${t('enq.title')}${summary?.newEnquiries
                        ? ` · ${summary.newEnquiries}` : ''}`}
                      onPress={onEnquiries} />
+        {/* A cluster is how an artisan with no GST reaches a marketplace at all,
+            so it is a primary action for them - and a different one entirely for
+            the person who runs the cluster. Showing both to everybody would put a
+            dashboard in front of somebody who has nothing to administer. */}
+        {artisan?.role === 'cluster_creator' ? (
+          <QuickAction icon={<Shield color={C.indigo} size={18} />}
+                       label={t('cd.title')} onPress={onClusterAdmin} />
+        ) : (
+          <QuickAction icon={<Users color={C.primary} size={18} />}
+                       label={t('clu.title')} onPress={onClusters} />
+        )}
         {p?.drafts ? (
           <QuickAction icon={<Camera color={C.inkSoft} size={18} />}
                        label={t('home.continueDraft')}

@@ -24,7 +24,8 @@ import { useStore } from '../lib/store';
 import * as connection from '../lib/connection';
 import { AiButton, Spark } from '../ui/AiButton';
 import ModeSheet from './ModeSheet';
-import { listen, isSupported, LANGS, Listener } from '../lib/speech';
+import { listen, isSupported, requestPermission, LANGS, Listener }
+  from '../lib/speech';
 import * as drafts from '../lib/drafts';
 import * as cache from '../lib/cache';
 
@@ -92,6 +93,18 @@ export default function Create({
   const [rawUri, setRawUri] = useState<string | null>(null);
   /** The draft on this phone. Exists from the first photograph, offline or not. */
   const [draftId, setDraftId] = useState<string | null>(null);
+  /*
+    The same id, held where it can be read back immediately.
+
+    `setDraftId` is a React state update, so within the same tick `draftId` is still
+    whatever it was when this closure was created - null, on the pass that has just
+    made a draft. `ensureDraft` read that stale null, decided no draft existed, and
+    made a second one. Two rows for one photograph, both nagging her to finish.
+
+    Every "do I already have a draft?" question reads the ref. The state is still
+    there because rendering needs it; it is just not the answer to that question.
+  */
+  const draftIdRef = useRef<string | null>(null);
   /** The backend's id, once a backend has seen it. Null is a normal state. */
   const [listingId, setListingId] = useState<string | null>(null);
   const [analysis, setAnalysis] = useState<api.AnalyzeOut | null>(null);
@@ -160,6 +173,9 @@ export default function Create({
   const [passport, setPassport] = useState<any>(null);
 
   const [camOpen, setCamOpen] = useState(false);
+  const [viewStep, setViewStep] = useState(0);
+  /** Is the listing's picture the AI's version, or hers untouched? */
+  const [aiImage, setAiImage] = useState(true);
   const [craft, setCraft] = useState<CategoryKey>('general');
   const planRef = useRef(new ShotPlan('general'));
   const [shots, setShots] = useState<{ key: string; uri: string }[]>([]);
@@ -194,6 +210,30 @@ export default function Create({
   const markSection = (i: number) => (e: any) => {
     sectionY.current[i] = e.nativeEvent.layout.y;
   };
+
+  /**
+   * Which section is on screen right now.
+   *
+   * Kept apart from `step`, which is about what is *finished*. The timeline used to
+   * show only completion, so scrolling through the page moved nothing and the five
+   * Continue buttons were the only thing that advanced it - a button per section on
+   * one scrolling page, which is two ways of doing the same thing and one too many.
+   *
+   * Now the page just scrolls. The bar follows the scroll, and a finished step stays
+   * green whether she is looking at it or not.
+   */
+  const onScroll = useCallback((e: any) => {
+    const y = e.nativeEvent.contentOffset.y + 90;   // a little below the header
+    const ys = sectionY.current;
+    let at = 0;
+    // Keyed by section index rather than a list, because sections mount as they
+    // become reachable and the gaps matter - a missing key means "not on screen yet".
+    for (let i = 0; i < STEPS.length; i++) {
+      const top = ys[i];
+      if (typeof top === 'number' && top <= y) at = i;
+    }
+    setViewStep(at);
+  }, []);
 
   // Where she can sell is a fact about the deployment, not about this minute's
   // connection, so the last real answer is kept and shown when there is no signal.
@@ -257,6 +297,7 @@ export default function Create({
         }
         if (f.priceRationale) { setRationale(String(f.priceRationale)); setRationaleDirty(true); }
         if (d.serverId) { listingIdRef.current = d.serverId; setListingId(d.serverId); }
+        draftIdRef.current = d.id;
       });
       return;
     }
@@ -438,16 +479,20 @@ export default function Create({
 
   /** Create the local draft if there isn't one, and keep it current. */
   async function ensureDraft(imageUri?: string | null): Promise<string> {
-    if (draftId) {
-      await drafts.patch(draftId, {
+    const existing = draftIdRef.current ?? draftId;
+    if (existing) {
+      await drafts.patch(existing, {
         craft, mode, ...(imageUri ? { imageUri } : {}),
         shots: planRef.current.captured,
       });
-      return draftId;
+      return existing;
     }
     const d = await drafts.create({
       craft, mode, imageUri: imageUri ?? null, shots: planRef.current.captured,
     });
+    // The ref first, and before any await, so a second caller in the same tick sees
+    // it. This ordering is the entire fix.
+    draftIdRef.current = d.id;
     setDraftId(d.id);
     session.setDraft(d.id);
     return d.id;
@@ -464,11 +509,13 @@ export default function Create({
     setErr('');
     try {
       const out = await api.analyze(uri, {
-        transcript, lang, background: 'none', listingId: listingId ?? undefined,
+        transcript, lang, background: 'none', listingId: listingIdRef.current ?? listingId ?? undefined,
         skipModels: true,
       } as any);
       setAnalysis(out);
       await adoptServerId(out.listingId);
+      // Manual mode is signed too: its operation log says that nothing was run.
+      if (out.passport) setPassport(out.passport);
     } catch (e: any) {
       // The draft is already on the phone. Failing to mirror it is a delay, not a
       // loss, and she carries on writing either way.
@@ -482,7 +529,7 @@ export default function Create({
   async function adoptServerId(id: string) {
     listingIdRef.current = id;
     setListingId(id);
-    const local = draftId ?? (await ensureDraft(rawUri));
+    const local = draftIdRef.current ?? draftId ?? (await ensureDraft(rawUri));
     await drafts.patch(local, { serverId: id, syncState: 'synced' });
   }
 
@@ -494,7 +541,7 @@ export default function Create({
       const b64 = await api.toBase64(uri);
       const job = await api.createJob({
         imageBase64: b64, transcript, lang, background: 'studio',
-        listingId: listingId ?? undefined,
+        listingId: listingIdRef.current ?? listingId ?? undefined,
       });
       setHandedOff(true);
       store.refreshJobs();
@@ -508,13 +555,26 @@ export default function Create({
     }
   }
 
-  async function runAnalyze(uri: string) {
-    setBusy(t('create.analysing'));
+  /**
+   * Send the photograph up.
+   *
+   * `plain` means keep her photograph exactly as it is and run no image models. It
+   * is the undo for the AI's work on the picture: the same row is rewritten with the
+   * original, so what a buyer sees is what she took. Idempotency in /v1/analyze is
+   * what makes that safe to call twice - before it, each call made a new listing.
+   */
+  async function runAnalyze(uri: string, opts?: { plain?: boolean }) {
+    const plain = !!opts?.plain;
+    setBusy(t(plain ? 'create.restoring' : 'create.analysing'));
     setErr('');
     try {
       const out = await api.analyze(uri, {
-        transcript, lang, background: 'studio', listingId: listingId ?? undefined,
-      });
+        transcript, lang,
+        background: plain ? 'none' : 'studio',
+        skipModels: plain,
+        listingId: listingIdRef.current ?? listingId ?? undefined,
+      } as any);
+      setAiImage(!plain);
       setAnalysis(out);
       await adoptServerId(out.listingId);
       const d = out.detected || {};
@@ -524,8 +584,10 @@ export default function Create({
       setCategory((v) => v || String(d.category ?? ''));
       setHsn((v) => v || String(d.hsn ?? ''));
       if (typeof d.price === 'number') setPriceStr((v) => v || String(d.price));
-      api.mintPassport({ rawHash: out.rawHash, ops: out.ops, artisanId: 'ART-UP-VNS-4471' })
-        .then(setPassport).catch(() => {});
+      // The passport now comes back with the analysis, signed on the server against
+      // this artisan's own row. The app used to mint it in a second call with a
+      // hard-coded maker id, and the result was never stored anywhere.
+      if (out.passport) setPassport(out.passport);
     } catch (e: any) {
       reportSoft(e);
     } finally {
@@ -581,14 +643,24 @@ export default function Create({
 
   /* ── step 3: voice + copy ────────────────────────────────────────────── */
 
-  function startRec() {
+  async function startRec() {
+    setErr('');
     setPartial('');
+    // Ask before opening the mic, and stop here if refused. Starting a recogniser
+    // without permission fails with a code nobody can act on.
+    const allowed = await requestPermission();
+    if (!allowed) {
+      setErr(t('create.micDenied'));
+      return;
+    }
     setRecording(true);
     recognizer.current = listen({
       lang,
       onPartial: setPartial,
-      onFinal: (t) => { setRecording(false); setTranscript(t); setPartial(''); },
-      onError: (m) => setErr(String(m)),
+      onFinal: (tx) => { setRecording(false); setTranscript(tx); setPartial(''); },
+      // An error clears the recording state and says what happened. Nothing is
+      // written to the transcript - a guess here becomes the product description.
+      onError: (m) => { setRecording(false); setPartial(''); setErr(String(m)); },
     });
   }
   function stopRec() {
@@ -603,7 +675,7 @@ export default function Create({
     try {
       const out = await api.catalog({
         transcript, lang, detected: analysis?.detected, ocrText: analysis?.ocr?.text,
-        listingId: listingId ?? undefined,
+        listingId: listingIdRef.current ?? listingId ?? undefined,
       });
       if (out.ok === false) { setErr(out.error || 'copy failed'); return; }
       setTitleEn(out.titleEn ?? titleEn);
@@ -668,7 +740,7 @@ export default function Create({
         detected: analysis?.detected,
         materialCost: parseFloat(materialStr) || 0,
         days: parseFloat(daysStr) || 1,
-        listingId: listingId ?? undefined,
+        listingId: listingIdRef.current ?? listingId ?? undefined,
       });
       setAdvice(a);
       setPriceStr((v) => v || String(a.suggested));
@@ -813,7 +885,7 @@ export default function Create({
         <View style={{ flexDirection: 'row', gap: 5, marginTop: S.lg }}>
           {STEPS.map((stepKey, i) => {
             const done = step > i;
-            const active = step === i;
+            const active = viewStep === i;
             return (
               <Pressable key={stepKey} onPress={() => goToStep(i)} hitSlop={8}
                          accessibilityRole="button"
@@ -839,7 +911,9 @@ export default function Create({
 
       <ScrollView ref={scroller}
                   contentContainerStyle={{ padding: S.lg, paddingBottom: 140, gap: S.lg }}
-                  showsVerticalScrollIndicator={false}>
+                  showsVerticalScrollIndicator={false}
+                  onScroll={onScroll}
+                  scrollEventThrottle={64}>
 
         {err ? (
           <Card tone="danger">
@@ -883,20 +957,33 @@ export default function Create({
               // The file on this phone comes first. The server's copy is a URL on a
               // machine that may not be reachable, and when it was preferred the
               // photograph she had just taken showed as an empty grey square.
-              <Image source={{ uri: rawUri || analysis!.imageUrl }}
+              // Whichever version is actually on the listing. Preferring the local
+              // file unconditionally meant the enhanced picture - the one buyers
+              // would see - was never on screen at all.
+              <Image source={{ uri: (aiImage && analysis?.imageUrl)
+                                    || rawUri || analysis?.imageUrl }}
                      style={{ width: '100%', aspectRatio: 1, borderRadius: R.lg,
                               backgroundColor: C.bgAlt }} resizeMode="contain" />
             ) : (
-              <View style={{ aspectRatio: 1, borderRadius: R.lg, borderWidth: 2,
-                             borderStyle: 'dashed', borderColor: C.lineStrong,
-                             alignItems: 'center', justifyContent: 'center', gap: S.md,
-                             backgroundColor: C.bgAlt }}>
-                <Camera color={C.primary} size={40} />
-                <Text style={T.body}>{t('create.takePhoto')}</Text>
-                <Text style={[T.bodySoft, { textAlign: 'center', paddingHorizontal: S.lg }]}>
-                  {t('create.takePhotoHint')}
-                </Text>
-              </View>
+              // The box is the button. It is the largest thing on the screen, it has
+              // a camera drawn in the middle of it and it says "take a photo" - so
+              // tapping it and having nothing happen is the app telling somebody they
+              // guessed wrong, when they had not.
+              <Pressable onPress={() => pick('camera')} accessibilityRole="button"
+                         accessibilityLabel={t('create.takePhoto')}
+                         style={({ pressed }) => ({ opacity: pressed ? 0.7 : 1 })}>
+                <View style={{ aspectRatio: 1, borderRadius: R.lg, borderWidth: 2,
+                               borderStyle: 'dashed', borderColor: C.lineStrong,
+                               alignItems: 'center', justifyContent: 'center', gap: S.md,
+                               backgroundColor: C.bgAlt }}>
+                  <Camera color={C.primary} size={40} />
+                  <Text style={T.body}>{t('create.takePhoto')}</Text>
+                  <Text style={[T.bodySoft, { textAlign: 'center',
+                                              paddingHorizontal: S.lg }]}>
+                    {t('create.takePhotoHint')}
+                  </Text>
+                </View>
+              </Pressable>
             )}
           </Card>
           <Card>
@@ -955,19 +1042,77 @@ export default function Create({
               </View>
             </Card>
           ) : null}
+          {/*
+            What the AI did to the photograph, and how to undo it.
+
+            This was invisible before. The screen always drew the local file, so she
+            never saw the enhanced version at all - while the enhanced version was
+            the one going to the marketplace. She could not tell what had been done,
+            and could not refuse it.
+
+            Both are now shown side by side with the live one marked, and either can
+            be made the one that ships.
+          */}
           {rawUri && analysis ? (
-            <Btn label={t('create.reanalyse')} tone="ghost"
-                 icon={<Sparkle color={C.ink} size={20} />}
-                 onPress={() => runAnalyze(rawUri)} />
+            <Card style={{ gap: S.md }}>
+              <Text style={T.label}>{t('create.whichPhoto')}</Text>
+
+              <View style={{ flexDirection: 'row', gap: S.md }}>
+                {([
+                  { on: aiImage, uri: analysis.imageUrl,
+                    label: t('create.aiVersion'), plain: false },
+                  { on: !aiImage, uri: rawUri,
+                    label: t('create.myVersion'), plain: true },
+                ]).map((opt) => (
+                  <Pressable key={opt.label} style={{ flex: 1 }}
+                             disabled={opt.on || !!busy}
+                             onPress={() => runAnalyze(rawUri, { plain: opt.plain })}>
+                    <View style={{ gap: 6, borderRadius: R.lg, padding: 6,
+                                   borderWidth: opt.on ? 2 : 1,
+                                   borderColor: opt.on ? C.primary : C.line,
+                                   backgroundColor: opt.on ? C.primarySoft : C.surface }}>
+                      <Image source={{ uri: opt.uri }}
+                             style={{ width: '100%', aspectRatio: 1,
+                                      borderRadius: R.md, backgroundColor: C.bgAlt }}
+                             resizeMode="cover" />
+                      <View style={{ flexDirection: 'row', alignItems: 'center',
+                                     gap: 4 }}>
+                        <Text style={[T.micro, { flex: 1, fontSize: 12,
+                                                 color: opt.on ? C.primaryDeep
+                                                               : C.inkMid }]}>
+                          {opt.label}
+                        </Text>
+                        {opt.on ? <Check color={C.primary} size={14} /> : null}
+                      </View>
+                    </View>
+                  </Pressable>
+                ))}
+              </View>
+
+              {/* Exactly what was done, in her language, one line each. The edit log
+                  was always recorded and never shown. */}
+              {aiImage && (analysis.ops || []).length ? (
+                <View style={{ gap: 2 }}>
+                  {(analysis.ops || []).map((op) => (
+                    <Text key={op} style={[T.micro, { fontSize: 12 }]}>
+                      {'• '}{t(`op.${op}` as any) !== `op.${op}`
+                        ? t(`op.${op}` as any) : op}
+                    </Text>
+                  ))}
+                </View>
+              ) : null}
+
+              <Text style={[T.micro, { fontSize: 11.5, color: C.inkSoft }]}>
+                {aiImage ? t('create.aiVersionNote') : t('create.myVersionNote')}
+              </Text>
+
+              <Btn label={t('create.reanalyse')} tone="ghost"
+                   icon={<Sparkle color={C.ink} size={20} />}
+                   busy={!!busy}
+                   onPress={() => runAnalyze(rawUri, { plain: !aiImage })} />
+            </Card>
           ) : null}
 
-          {/* The photograph is taken and there is somewhere to go. This button was
-              simply missing before: in manual mode nothing followed the shutter. */}
-          {hasPhoto ? (
-            <Btn label={t('common.continue')} tone="money"
-                 icon={<Arrow color={C.white} size={20} />}
-                 onPress={() => goToStep(1)} />
-          ) : null}
         </Section>
         </View>
 
@@ -1002,9 +1147,6 @@ export default function Create({
                          icon={<Sparkle color={C.primaryDeep} size={18} />}
                          busy={!!busy} onPress={() => runAnalyze(rawUri)} />
                   ) : null}
-                  <Btn label={t('common.continue')} tone="money" style={{ flex: 1 }}
-                       icon={<Arrow color={C.white} size={18} />}
-                       onPress={() => goToStep(2)} />
                 </View>
               </Card>
             ) : null}
@@ -1072,11 +1214,6 @@ export default function Create({
             </Card>
             ) : null}
 
-            {analysis ? (
-              <Btn label={t('common.continue')} tone="money"
-                   icon={<Arrow color={C.white} size={20} />}
-                   onPress={() => goToStep(2)} />
-            ) : null}
           </Section>
           </View>
         ) : null}
@@ -1140,6 +1277,9 @@ export default function Create({
               {!isSupported() ? (
                 <Pill text={t('create.noMic')} tone="warn" />
               ) : null}
+              {/* No fabricated transcript any more: if the recogniser cannot run,
+                  the AI button below is the way forward, and it works from the
+                  photograph alone. */}
               <Btn label={t('create.writeWithAI')} tone="tonal"
                    icon={<Sparkle color={C.primaryDeep} size={20} />}
                    busy={busy === t('create.writing')} onPress={writeCopy} />
@@ -1180,9 +1320,6 @@ export default function Create({
               <Field label={t('create.quantity')} value={qtyStr} onChange={setQtyStr} numeric />
             </Card>
 
-            <Btn label={t('common.continue')} tone="money"
-                 icon={<Arrow color={C.white} size={20} />}
-                 onPress={() => goToStep(3)} />
           </Section>
           </View>
         ) : null}
@@ -1299,9 +1436,6 @@ export default function Create({
                      placeholder={t('create.explainPlaceholder')} />
             </Card>
 
-            <Btn label={t('common.continue')} tone="money"
-                 icon={<Arrow color={C.white} size={20} />}
-                 onPress={() => goToStep(4)} />
           </Section>
           </View>
         ) : null}
@@ -1473,8 +1607,10 @@ export default function Create({
                 </View>
                 <View style={{ flexDirection: 'row', gap: S.lg, alignItems: 'center' }}>
                   <View style={{ backgroundColor: C.white, padding: 7, borderRadius: R.md }}>
-                    <QRCode value={passport.id} size={72} color={C.indigoDeep}
-                            backgroundColor={C.white} />
+                    {/* The verification URL, not the bare id. A camera app can open a
+                        URL; scanning "KK-BNS-2026-4F2A19C0D3" opened nothing at all. */}
+                    <QRCode value={passport.verifyUrl || passport.id} size={72}
+                            color={C.indigoDeep} backgroundColor={C.white} />
                   </View>
                   <View style={{ flex: 1, gap: 2 }}>
                     <Text style={[T.body, { fontFamily: 'Mukta_800ExtraBold',
@@ -1485,6 +1621,13 @@ export default function Create({
                           numberOfLines={1}>{passport.signature}</Text>
                   </View>
                 </View>
+                {passport.verifyUrl ? (
+                  <Pressable onPress={() => Linking.openURL(passport.verifyUrl)}>
+                    <Text style={[T.micro, { color: C.primaryLite, fontSize: 12 }]}>
+                      {t('create.passportVerify')}
+                    </Text>
+                  </Pressable>
+                ) : null}
               </LinearGradient>
             ) : null}
 

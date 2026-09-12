@@ -56,6 +56,8 @@ type Ctx = {
   refresh: (opts?: { silent?: boolean }) => Promise<void>;
   refreshJobs: () => Promise<void>;
   dismissJob: (id: string) => Promise<void>;
+  /** Discard a draft, on the phone and on the server. Refuses anything sold. */
+  deleteDraft: (id: string) => Promise<void>;
   refreshOrders: () => Promise<void>;
   editListing: (id: string, fields: Record<string, any>,
                 baseUpdatedAt?: string | null) => Promise<void>;
@@ -171,16 +173,36 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
           skipModels: d.mode === 'manual',
         } as any);
         await drafts.patch(d.id, { serverId: out.listingId, syncState: 'synced' });
-        // Whatever she typed offline belongs on the row, not just the photograph.
+
+        /*
+          Whatever she typed offline belongs on the row, not just the photograph.
+
+          Only the fields she actually filled in, though. This used to send
+          `titleEn: f.titleEn ?? ''` for all nine fields, which meant a draft
+          carrying only a price wiped the title and both descriptions on the server -
+          including a title the AI had written and she had then edited and published.
+          She watched her own words disappear and the listing drop back to
+          "unfinished".
+
+          An absent key now means "I have nothing to say about this field", which is
+          what it always meant, rather than "set it to empty".
+        */
         const f = d.fields || {};
-        if (Object.keys(f).length) {
-          await api.updateListing(out.listingId, {
-            titleEn: f.titleEn ?? '', titleHi: f.titleHi ?? '',
-            descEn: f.descEn ?? '', descHi: f.descHi ?? '',
-            category: f.category ?? '', hsn: f.hsn ?? '',
-            price: Number(f.price) || 0, quantity: Number(f.quantity) || 1,
-            channelsSelected: Array.isArray(f.channelsSelected) ? f.channelsSelected : [],
-          } as any).catch(() => { /* the row exists; the edit retries through the queue */ });
+        const patch: Record<string, any> = {};
+        for (const k of ['titleEn', 'titleHi', 'descEn', 'descHi',
+                         'category', 'hsn'] as const) {
+          if (typeof f[k] === 'string' && f[k].trim()) patch[k] = f[k];
+        }
+        if (f.price !== undefined && Number(f.price) > 0) patch.price = Number(f.price);
+        if (f.quantity !== undefined && Number(f.quantity) > 0) {
+          patch.quantity = Number(f.quantity);
+        }
+        if (Array.isArray(f.channelsSelected) && f.channelsSelected.length) {
+          patch.channelsSelected = f.channelsSelected;
+        }
+        if (Object.keys(patch).length) {
+          await api.updateListing(out.listingId, patch as any)
+            .catch(() => { /* the row exists; the edit retries through the queue */ });
         }
       } catch (e: any) {
         // Offline again, or the server said no. Either way the draft stays.
@@ -403,6 +425,37 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
    * this phone. A listing an artisan finished in a place with no signal has to be
    * visible in her own product list, or as far as she can tell it never happened.
    */
+  /**
+   * Discard a draft, wherever it lives.
+   *
+   * A draft can be in two places at once: on the phone, and mirrored on the server
+   * once it has been uploaded. Deleting one and not the other is how it comes back
+   * on the next refresh, so both go.
+   *
+   * The local copy is removed last. If the server refuses - because the listing
+   * turned out to be published, or somebody has ordered it - the draft is still on
+   * her phone and the reason is raised, rather than the work vanishing locally while
+   * the row survives.
+   */
+  const deleteDraft = useCallback(async (id: string) => {
+    const local = drafts.isLocalId(id) ? await drafts.get(id) : null;
+    const serverId = local?.serverId ?? (drafts.isLocalId(id) ? null : id);
+
+    if (serverId) {
+      await api.deleteListing(serverId);
+      setCards((prev) => prev.filter((c) => c.id !== serverId));
+    }
+    if (local) await drafts.remove(local.id);
+    else if (drafts.isLocalId(id)) await drafts.remove(id);
+    else {
+      // A server row she reached from the product list: drop any local draft that
+      // was pointing at it, or it reappears as an orphan.
+      const mirror = (await drafts.all()).find((d) => d.serverId === id);
+      if (mirror) await drafts.remove(mirror.id);
+    }
+    await reloadDrafts();
+  }, [reloadDrafts]);
+
   const mergedCards = useMemo<api.Card[]>(
     () => [...localDrafts.map(draftCard), ...cards], [localDrafts, cards]);
 
@@ -412,11 +465,11 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     jobs, jobsWorking, jobsReady,
     loading, lastSync,
     refresh, refreshOrders, refreshJobs, dismissJob,
-    editListing, setArtisan, signOut, dismissConflict,
+    editListing, setArtisan, signOut, dismissConflict, deleteDraft,
   }), [ready, online, offline, pendingWrites, conflicts, artisan, readiness, summary,
        mergedCards, localDrafts, orders, enquiries, insights, jobs, jobsWorking, jobsReady,
        loading, lastSync, refresh, refreshOrders, refreshJobs, dismissJob,
-       editListing, setArtisan, signOut, dismissConflict]);
+       editListing, setArtisan, signOut, dismissConflict, deleteDraft]);
 
   return <StoreCtx.Provider value={value}>{children}</StoreCtx.Provider>;
 }

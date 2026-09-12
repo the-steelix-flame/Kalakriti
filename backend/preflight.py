@@ -534,6 +534,42 @@ def _weak(val: str) -> str:
 
 # ------------------------------------------------------------- 6. OTP delivery
 
+def _msg91_zero_balance() -> tuple[bool, bool]:
+    """
+    Is the MSG91 wallet empty? Returns (is_zero, was_actually_checked).
+
+    Uses the old balance.php endpoint because it is the one that answers to a plain
+    auth key; the v5 route does not exist. Three route types are read, since credits
+    are held per route and a transactional balance is what OTP spends.
+
+    Unreachable or unparseable is reported as "not checked" rather than as fine. A
+    balance we could not read is not evidence of a balance.
+    """
+    import os                                            # noqa: PLC0415
+
+    import requests                                      # noqa: PLC0415
+
+    key = os.getenv("MSG91_AUTH_KEY", "")
+    if not key:
+        return False, False
+
+    seen_any = False
+    for route in ("4", "1", "106"):                      # transactional, promo, intl
+        try:
+            r = requests.get("https://control.msg91.com/api/balance.php",
+                             params={"authkey": key, "type": route}, timeout=15)
+            if r.status_code != 200:
+                continue
+            raw = r.text.strip()
+            value = float(raw)
+        except Exception:
+            continue
+        seen_any = True
+        if value > 0:
+            return False, True
+    return seen_any, seen_any
+
+
 def check_otp() -> None:
     title = "6. OTP delivery"
     import sms                                          # noqa: PLC0415
@@ -549,6 +585,34 @@ def check_otp() -> None:
                   f"sending a real SMS costs money and puts a code on a real handset, "
                   f"so preflight will not do it. Confirm delivery once by hand with a "
                   f"real login.")
+
+        # One thing worth checking, because it is free and it is the trap that cost
+        # an afternoon: MSG91 accepts a send with an empty wallet and answers
+        # {"type":"success"} with a request id. Nothing is delivered. The app then
+        # tells the artisan a code is on its way and she waits for a message that
+        # was never sent, which is indistinguishable from the app being broken.
+        if provider == "msg91":
+            zero, checked = _msg91_zero_balance()
+            if zero:
+                report(FAIL, title,
+                       "MSG91 is configured and authenticating, but the account "
+                       "balance is zero on every route. Sends will be accepted and "
+                       "answered with type=success and a request id, and no SMS will "
+                       "arrive. Nobody can log in, and nothing in the response says "
+                       "so.\n"
+                       "Note that MSG91's own signup verification codes still reach "
+                       "your phone - those are MSG91 verifying you, not this app "
+                       "sending anything, and they are easy to mistake for a working "
+                       "integration.",
+                       "Add SMS credits to the MSG91 account,\n"
+                       "or set FAST2SMS_API_KEY instead (free trial credit, no DLT "
+                       "template needed)")
+                return
+            if checked:
+                detail += " The account has a non-zero SMS balance."
+            else:
+                detail += (" The account balance could not be read, so a zero-balance "
+                           "wallet would still accept sends and deliver nothing.")
         if echo:
             report(FAIL if STRICT else WARN, title, detail +
                    "\nOTP_DEV_ECHO is also on, which returns the code in the API "
@@ -568,7 +632,8 @@ def check_otp() -> None:
                "delivered. That is the right setting on a laptop. In a hosted "
                "deployment it means nobody but the developer can log in, while the "
                "login screen looks like it works.",
-               "MSG91_AUTH_KEY=...\nMSG91_TEMPLATE_ID=...   (DLT-registered template)\n"
+               "FAST2SMS_API_KEY=...   (fastest: an API key only, no DLT template)\n"
+               "or MSG91_AUTH_KEY=... and MSG91_TEMPLATE_ID=...   (own DLT template)\n"
                "then remove OTP_DEV_ECHO")
         return
 
@@ -577,7 +642,8 @@ def check_otp() -> None:
            "code is never delivered, so nobody can complete a login - including the "
            "developer. This is not a hosted-only problem: login is impossible in every "
            "environment until one of these is set.",
-           "MSG91_AUTH_KEY=... and MSG91_TEMPLATE_ID=...\n"
+           "FAST2SMS_API_KEY=...   (fastest: an API key only, no DLT template)\n"
+           "or MSG91_AUTH_KEY=... and MSG91_TEMPLATE_ID=...   (own DLT template)\n"
            "or TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_FROM_NUMBER\n"
            "or OTP_DEV_ECHO=true  (local development only)")
 
@@ -630,6 +696,51 @@ def check_logistics() -> None:
 
 # ---------------------------------------------------------------------- main
 
+# --------------------------------------------------- 6b. demo accounts
+
+def check_demo_accounts() -> None:
+    """
+    Are the seeded demo accounts still present with their seeded passwords?
+
+    They exist so the product can be shown while SMS delivery is unpaid, and they are
+    real accounts with real scrypt hashes - nothing about them is a bypass. What makes
+    them dangerous is that their passwords are *memorable*, which is the same thing as
+    guessable, and they are written down in a file in the repository.
+
+    On a laptop that is fine and this warns. Anywhere hosted it is a published
+    credential for a verified account, so it fails.
+    """
+    title = "6b. Demo accounts"
+    try:
+        import auth  # noqa: PLC0415
+        import db  # noqa: PLC0415
+        import seed_demo_users  # noqa: PLC0415
+    except Exception as e:                              # noqa: BLE001
+        report(WARN, title, f"Could not check: {type(e).__name__}: {e}")
+        return
+
+    s = db.session()
+    try:
+        live = []
+        for spec in seed_demo_users.DEMO:
+            a = s.query(db.Artisan).filter(db.Artisan.phone == spec["phone"]).first()
+            if a and auth.check_password(spec["password"], a.password_hash or ""):
+                live.append(f"{spec['phone']} ({spec['role']})")
+    finally:
+        s.close()
+
+    if not live:
+        report(PASS, title, "No seeded demo account is using its seeded password.")
+        return
+
+    report(FAIL if STRICT else WARN, title,
+           "These accounts still have the password written in "
+           "seed_demo_users.py:\n  " + "\n  ".join(live) + "\n"
+           "Anyone who has seen this repository can sign in as them. They are "
+           "verified accounts, so that is a real seller identity, not a sandbox.",
+           "python seed_demo_users.py --remove")
+
+
 def main() -> int:
     global STRICT
     ap = argparse.ArgumentParser(
@@ -663,7 +774,8 @@ def main() -> int:
     print()
 
     for check in (check_llm, check_database, check_storage, check_public_base_url,
-                  check_secrets, check_otp, check_channels, check_logistics):
+                  check_secrets, check_otp, check_demo_accounts, check_channels,
+                  check_logistics):
         try:
             check()
         except Exception as e:                          # noqa: BLE001

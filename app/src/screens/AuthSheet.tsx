@@ -41,6 +41,8 @@ export default function AuthSheet({
   const [phone, setPhone] = useState('');
   const [challengeId, setChallengeId] = useState('');
   const [code, setCode] = useState('');
+  const [password, setPassword] = useState('');
+  const [byPassword, setByPassword] = useState(false);
   const [devCode, setDevCode] = useState('');
   const [cooldown, setCooldown] = useState(0);
 
@@ -122,35 +124,58 @@ export default function AuthSheet({
     } finally { setBusy(false); }
   }
 
+  /**
+   * Everything that happens once a sign-in succeeds, whichever credential proved it.
+   *
+   * Shared by the OTP path and the password path deliberately. Which credential
+   * somebody used says nothing about what should happen next - the language sync,
+   * the readiness fetch and the drafts they made as a guest are all identical - and
+   * two copies of this drifting apart is how one route quietly stops claiming
+   * drafts.
+   */
+  async function afterAuth(token: string, who: api.Artisan, claimedDrafts: number) {
+    session.setToken(token);
+    setArtisan(who);
+    // The language chosen on this device wins, and is pushed up to the account so
+    // it follows the artisan to another phone. Taking the account's language
+    // instead - which this used to do - meant signing in silently changed the
+    // interface out from under somebody who had just picked Gujarati, because the
+    // account still held the default. The account's language is only adopted when
+    // the device has no choice of its own recorded.
+    const chosen = session.getLang();
+    if (chosen) {
+      if (who.language !== chosen) {
+        api.updateProfile({ language: chosen }).catch(() => { /* queued elsewhere */ });
+      }
+    } else if (who.language) {
+      setLang(who.language as any);
+    }
+    const rd = await api.readiness();
+    setReadiness(rd.readiness);
+    setFullName(who.fullName);
+    if (claimedDrafts > 0) {
+      setNotice(t('auth.workKept', { n: claimedDrafts }));
+    }
+    const nxt = nextStage(who, rd.readiness);
+    setStage(nxt);
+    if (nxt === 'done') onAuthed(who);
+  }
+
   async function verify() {
     setBusy(true); setErr('');
     try {
       const r = await api.verifyOtp(challengeId, code, session.guestToken());
-      session.setToken(r.token);
-      setArtisan(r.artisan);
-      // The language chosen on this device wins, and is pushed up to the account so
-      // it follows the artisan to another phone. Taking the account's language
-      // instead - which this used to do - meant signing in silently changed the
-      // interface out from under somebody who had just picked Gujarati, because the
-      // account still held the default. The account's language is only adopted when
-      // the device has no choice of its own recorded.
-      const chosen = session.getLang();
-      if (chosen) {
-        if (r.artisan.language !== chosen) {
-          api.updateProfile({ language: chosen }).catch(() => { /* queued elsewhere */ });
-        }
-      } else if (r.artisan.language) {
-        setLang(r.artisan.language as any);
-      }
-      const rd = await api.readiness();
-      setReadiness(rd.readiness);
-      setFullName(r.artisan.fullName);
-      if (r.claimedDrafts > 0) {
-        setNotice(t('auth.workKept', { n: r.claimedDrafts }));
-      }
-      const nxt = nextStage(r.artisan, rd.readiness);
-      setStage(nxt);
-      if (nxt === 'done') onAuthed(r.artisan);
+      await afterAuth(r.token, r.artisan, r.claimedDrafts);
+    } catch (e: any) {
+      setErr(e?.message || String(e));
+    } finally { setBusy(false); }
+  }
+
+  async function signInWithPassword() {
+    setBusy(true); setErr('');
+    try {
+      const r = await api.loginWithPassword(phone.replace(/\D/g, ''), password);
+      await afterAuth(r.token, r.artisan, r.claimedDrafts);
     } catch (e: any) {
       setErr(e?.message || String(e));
     } finally { setBusy(false); }
@@ -270,9 +295,37 @@ export default function AuthSheet({
                          numeric suffix="+91" placeholder={t('auth.tenDigits')} />
                   <Text style={[T.micro, { fontSize: 12 }]}>{t('auth.whyPhone')}</Text>
                 </Card>
-                <Btn label={t('auth.sendCode')} tone="money" large busy={busy}
-                     disabled={phone.replace(/\D/g, '').length !== 10}
-                     onPress={sendOtp} />
+                {byPassword ? (
+                  <>
+                    <Card>
+                      <Field label={t('auth.password')} value={password}
+                             onChange={setPassword}
+                             placeholder={t('auth.passwordPlaceholder')} secure />
+                      <Text style={[T.micro, { fontSize: 12 }]}>
+                        {t('auth.passwordWhy')}
+                      </Text>
+                    </Card>
+                    <Btn label={t('auth.signInBtn')} tone="money" large busy={busy}
+                         disabled={phone.replace(/\D/g, '').length !== 10
+                                   || password.length < 1}
+                         onPress={signInWithPassword} />
+                  </>
+                ) : (
+                  <Btn label={t('auth.sendCode')} tone="money" large busy={busy}
+                       disabled={phone.replace(/\D/g, '').length !== 10}
+                       onPress={sendOtp} />
+                )}
+
+                {/* The OTP is the front door and stays the default. This is here
+                    because SMS delivery can simply be unavailable, and when it is
+                    there would otherwise be no way in at all. */}
+                <Pressable onPress={() => { setByPassword(!byPassword); setErr(''); }}
+                           hitSlop={10}>
+                  <Text style={[T.micro, { color: C.primaryDeep, textAlign: 'center',
+                                           paddingVertical: S.sm }]}>
+                    {byPassword ? t('auth.useOtp') : t('auth.usePassword')}
+                  </Text>
+                </Pressable>
               </>
             ) : null}
 

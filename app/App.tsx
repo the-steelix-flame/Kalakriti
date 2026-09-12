@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useState } from 'react';
-import { View, Text, ActivityIndicator, Pressable } from 'react-native';
+import { View, Text, ActivityIndicator, Pressable, Alert } from 'react-native';
 import { StatusBar } from 'expo-status-bar';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 import {
@@ -19,6 +19,9 @@ import ProductDetail from './src/screens/ProductDetail';
 import * as drafts from './src/lib/drafts';
 import MarketplaceDetail from './src/screens/MarketplaceDetail';
 import Enquiries from './src/screens/Enquiries';
+import Clusters from './src/screens/Clusters';
+import ClusterDashboard from './src/screens/ClusterDashboard';
+import GoodsReceipts from './src/screens/GoodsReceipts';
 import Create from './src/screens/Create';
 import { TabBar, TabKey } from './src/nav/Shell';
 import { I18nProvider, useI18n } from './src/i18n';
@@ -45,7 +48,10 @@ type Stack =
   | { screen: 'create'; resumeId?: string | null }
   | { screen: 'product'; id: string }
   | { screen: 'marketplace'; id: string; channel: string }
-  | { screen: 'enquiries' };
+  | { screen: 'enquiries' }
+  | { screen: 'clusters' }
+  | { screen: 'clusterAdmin' }
+  | { screen: 'grn'; clusterId: string; enquiryId?: string };
 
 /** Offline and unsent-work notice, shown above every tab that reads from the server. */
 function SyncBanner() {
@@ -104,6 +110,9 @@ function AppInner() {
   });
 
   const store = useStore();
+  // Needed for the delete confirmation below, which has to be readable in whichever
+  // language she chose - a destructive prompt in English is worse than no prompt.
+  const { t } = useI18n();
   const [onboarded, setOnboarded] = useState(false);
   const [tab, setTab] = useState<TabKey>('home');
   const [stack, setStack] = useState<Stack>({ screen: 'tabs' });
@@ -126,6 +135,36 @@ function AppInner() {
     if (drafts.isLocalId(id)) setStack({ screen: 'create', resumeId: id });
     else setStack({ screen: 'product', id });
   }, []);
+
+  /**
+   * Confirm before discarding a draft.
+   *
+   * Destructive and irreversible, so it asks - and it says the photograph goes too,
+   * because that is the part somebody would not think of and would miss.
+   *
+   * A refusal from the server (it turned out to be published, or somebody ordered
+   * it) is shown as the reason it gave rather than swallowed. The draft is still
+   * there either way.
+   */
+  const askDeleteDraft = useCallback((id: string, title: string) => {
+    Alert.alert(
+      t('prod.deleteDraft'),
+      title ? t('prod.deleteAskNamed', { what: title }) : t('prod.deleteAsk'),
+      [
+        { text: t('common.cancel'), style: 'cancel' },
+        {
+          text: t('common.delete'),
+          style: 'destructive',
+          onPress: async () => {
+            try {
+              await store.deleteDraft(id);
+            } catch (e: any) {
+              Alert.alert('', e?.message || 'Could not delete that.');
+            }
+          },
+        },
+      ]);
+  }, [store, t]);
 
   const backToTabs = useCallback(() => {
     setStack({ screen: 'tabs' });
@@ -199,6 +238,26 @@ function AppInner() {
             onBack={backToTabs}
             onRefresh={store.refreshOrders}
           />
+        ) : stack.screen === 'clusters' ? (
+          <Clusters
+            onBack={backToTabs}
+            onLanguage={openLang}
+            onChanged={() => store.refresh()}
+          />
+        ) : stack.screen === 'clusterAdmin' ? (
+          <ClusterDashboard
+            onBack={backToTabs}
+            onLanguage={openLang}
+            onChanged={() => store.refresh()}
+            onGoodsReceipts={(clusterId) => setStack({ screen: 'grn', clusterId })}
+          />
+        ) : stack.screen === 'grn' ? (
+          <GoodsReceipts
+            clusterId={stack.clusterId}
+            enquiryId={stack.enquiryId}
+            onBack={() => setStack({ screen: 'clusterAdmin' })}
+            onLanguage={openLang}
+          />
         ) : (
           <>
             <View style={{ flex: 1 }}>
@@ -219,6 +278,8 @@ function AppInner() {
                   onOpenProduct={openProduct}
                   onResumeDraft={(id) => setStack({ screen: 'create', resumeId: id })}
                   onEnquiries={() => setStack({ screen: 'enquiries' })}
+                  onClusters={() => setStack({ screen: 'clusters' })}
+                  onClusterAdmin={() => setStack({ screen: 'clusterAdmin' })}
                   onLogin={() => setAuthOpen(true)}
                   onLanguage={openLang}
                   onTab={setTab}
@@ -234,6 +295,7 @@ function AppInner() {
                   onOpen={openProduct}
                   onLanguage={openLang}
                   onRefresh={store.refresh}
+                  onDelete={askDeleteDraft}
                 />
               )}
               {tab === 'orders' && (

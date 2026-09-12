@@ -52,7 +52,12 @@ async function call<T>(path: string, init?: RequestInit, timeoutMs = 300000): Pr
     try { json = text ? JSON.parse(text) : {}; } catch { json = { detail: text }; }
     if (!r.ok) {
       const d = json?.detail;
-      const msg = typeof d === 'string' ? d : (d?.message || `HTTP ${r.status}`);
+      // `why` is the cluster endpoints' field, and it is written to be read aloud to
+      // an artisan rather than logged. Preferring it over a bare status code is the
+      // difference between "HTTP 409" and "you have 10 units free and this needs 30".
+      const msg = typeof d === 'string'
+        ? d
+        : (d?.why || d?.message || `HTTP ${r.status}`);
       throw new ApiError(r.status, d, msg);
     }
     return json as T;
@@ -80,6 +85,13 @@ export type Listing = {
   attributes: Record<string, any>;
   tags: string[];
   imageUrl: string; rawHash: string; enhanceOps: string[];
+  /** The photograph as taken, kept beside the enhanced one for the passport page. */
+  rawUrl?: string;
+  /** Null until a photograph has been analysed, which is what mints the passport. */
+  passport?: {
+    id: string; signature: string; publicKey: string;
+    payload: string; mintedAt: string | null;
+  } | null;
   vision: any; ocr: { boxes?: OcrBox[]; text?: string };
   transcript: string; status: string;
   channelsSelected: string[];
@@ -104,6 +116,10 @@ export type Order = {
 
 export type AnalyzeOut = {
   listingId: string; imageUrl: string; rawHash: string;
+  /** The photograph as it was taken, kept so the passport page can show both. */
+  rawUrl?: string;
+  /** Signed on the server as part of the analysis - no second call to mint it. */
+  passport?: Passport;
   ops: string[]; ms: number;
   ocr: { ok: boolean; boxes: OcrBox[]; text: string; engine?: string };
   detected: Record<string, any>;
@@ -188,14 +204,40 @@ export const listingStatus = (id: string) =>
 export const listOrders = () => get<{ orders: Order[] }>('/v1/orders');
 export const updateOrder = (id: string, body: any) => patch<Order>(`/v1/orders/${id}`, body);
 
-export const mintPassport = (b: { rawHash: string; ops: string[]; artisanId: string }) =>
-  post<any>('/v1/passport', b);
+/**
+ * Mint the Provenance Passport for a listing.
+ *
+ * `listingId` is what makes the passport survive the response that created it: the
+ * server stores it on the listing and serves `verifyUrl` publicly, which is the URL
+ * the QR code encodes. Without it the passport is signed and immediately lost.
+ */
+export const mintPassport = (b: {
+  rawHash: string; ops: string[]; artisanId: string; listingId?: string;
+}) => post<Passport>('/v1/passport', b);
+
+export type Passport = {
+  id: string;
+  rawHash: string;
+  enhanceOps: string[];
+  artisanId: string;
+  giTag: string | null;
+  geo: string | null;
+  capturedAt: string;
+  signature: string;
+  publicKey: string;
+  listingId: string | null;
+  stored: boolean;
+  /** The page a plain camera app opens when it scans the QR code. */
+  verifyUrl: string;
+};
 
 export const trends = (cluster: string) =>
   post<{ trends: any[]; source: string }>('/v1/trends', { cluster }, 300000);
 
 
 /* ─────────────────────────────────────────────── auth, profile, logistics */
+
+export type Role = 'artisan' | 'solo_seller' | 'cluster_creator';
 
 export type Address = {
   id?: string; kind: string; contactName: string; contactPhone: string;
@@ -208,6 +250,16 @@ export type Artisan = {
   businessName: string; email: string; language: string; cluster: string;
   gstin: string; pan: string; bankAccount: string; bankIfsc: string;
   addresses: Address[]; accounts: any[];
+  /**
+   * Which of the three user types this is. `artisan` is the default and the only
+   * one that requires no paperwork, so a new signup is never blocked on documents
+   * they do not have.
+   */
+  role: Role;
+  /** Pieces per cycle, and how many of them are already promised. One pair per
+   *  person, not per cluster - that is what stops the same weeks being sold twice. */
+  capacityUnits: number;
+  capacityCommitted: number;
 };
 
 export type Check = {
@@ -431,3 +483,186 @@ export const assist = (b: { listingId: string; field: AssistField;
 export const assistContinue = (b: { listingId: string; from_step?: string }) =>
   post<{ listingId: string; suggestions: Record<string, any>; note: string }>(
     '/v1/assist/continue', b, 600000);
+
+/* ------------------------------------------------------------- clusters */
+
+export type ClusterRating = {
+  available: boolean; count: number; why: string;
+  overall: number | null; paidOnTime: number | null;
+  commissionFair: number | null; ordersRegular: number | null;
+};
+
+export type ClusterPlatform = {
+  channel: string; name: string; live: boolean; why: string;
+};
+
+export type ClusterPayouts = {
+  available: boolean; count: number; why: string;
+  averagePerArtisan: number | null; totalPaid: number | null;
+};
+
+export type Membership = {
+  id: string; clusterId: string; artisanId: string;
+  status: 'active' | 'left'; joinedAt: string | null; leftAt: string | null;
+};
+
+export type ClusterMember = Membership & {
+  name: string; phone: string;
+  capacityUnits: number; capacityAvailable: number;
+};
+
+export type Cluster = {
+  id: string; ownerArtisanId: string; name: string; craftCategory: string;
+  district: string; state: string;
+  commissionPct: number; maxOrderUnits: number;
+  inviteCode: string; status: string; memberCount: number;
+  createdAt: string | null;
+  ownerName: string; ownerGstinLast4: string;
+  capacityAvailableUnits: number;
+  rating: ClusterRating;
+  platforms: ClusterPlatform[];
+  payouts: ClusterPayouts;
+  viewerMembership: Membership | null;
+  viewerIsOwner: boolean;
+  /** Owner-only, returned by getCluster when the caller owns it. */
+  members?: ClusterMember[];
+  /** Present on the `mine=true` listing. */
+  membership?: Membership;
+};
+
+export type Capacity = {
+  artisanId: string; capacityUnits: number;
+  capacityCommitted: number; capacityAvailable: number;
+};
+
+/** Open clusters, filterable. Works signed out - terms are readable before joining. */
+export const browseClusters = (p: { craftCategory?: string; district?: string;
+                                    state?: string; q?: string } = {}) => {
+  const qs = new URLSearchParams(
+    Object.entries(p).filter(([, v]) => !!v) as [string, string][]).toString();
+  return get<{ clusters: Cluster[] }>(`/v1/clusters${qs ? `?${qs}` : ''}`);
+};
+
+/** The caller's own memberships, plus any clusters they own. */
+export const myClusters = () =>
+  get<{ clusters: Cluster[]; owned: Cluster[] }>('/v1/clusters?mine=true');
+
+export const getCluster = (id: string) => get<Cluster>(`/v1/clusters/${id}`);
+
+/**
+ * Resolve an invite code WITHOUT joining.
+ *
+ * Deliberately a separate call from join: scanning a QR code should show somebody
+ * the commission and the platforms they are about to sell under, not enrol them.
+ */
+export const clusterByCode = (code: string) =>
+  get<Cluster>(`/v1/clusters/by-code/${encodeURIComponent(code.trim())}`);
+
+export const createCluster = (b: {
+  name: string; craftCategory?: string; commissionPct: number;
+  maxOrderUnits?: number; district?: string; state?: string;
+}) => post<Cluster>('/v1/clusters', b);
+
+export const joinCluster = (id: string) =>
+  post<{ membership: Membership; cluster: Cluster }>(`/v1/clusters/${id}/join`, {});
+
+export const joinClusterByCode = (inviteCode: string) =>
+  post<{ membership: Membership; cluster: Cluster }>(
+    '/v1/clusters/join', { inviteCode: inviteCode.trim() });
+
+export const leaveCluster = (id: string) =>
+  post<Membership>(`/v1/clusters/${id}/leave`, {});
+
+/** The Solo Seller / Cluster Creator switch. Changeable at any time, both ways. */
+export const setRole = (role: Role) => patch<Artisan>('/v1/me/role', { role });
+
+/** How many units this artisan can make in a cycle. One number per person. */
+export const setCapacity = (units: number) =>
+  patch<Artisan>('/v1/me/capacity', { units });
+
+export const commitCapacity = (b: { units: number; clusterId?: string;
+                                    reason?: string }) =>
+  post<Capacity>('/v1/me/capacity/commit', b);
+
+export const releaseCapacity = (b: { units: number; reason?: string }) =>
+  post<Capacity>('/v1/me/capacity/release', b);
+
+/* --------------------------------------------------- goods receipt notes */
+
+export type GoodsReceipt = {
+  id: string; clusterId: string; artisanId: string;
+  orderId: string | null; enquiryId: string | null;
+  quantityReceived: number; quantityRejected: number; quantityAccepted: number;
+  qualityStatus: 'pass' | 'partial' | 'reject' | 'void';
+  note: string; loggedBy: string; receivedAt: string | null;
+};
+
+export type TallyRow = {
+  artisanId: string; name: string; phone: string;
+  received: number; rejected: number; accepted: number;
+  deliveries: number; stillInCluster: boolean;
+};
+
+export type Tally = {
+  clusterId: string; orderId: string; enquiryId: string;
+  received: number; rejected: number; accepted: number; deliveries: number;
+  byArtisan: TallyRow[];
+  /**
+   * `null` when these receipts are not against a bulk enquiry. That is reported as
+   * unknown rather than as zero, the same rule the marketplace metrics follow:
+   * not knowing the target and having hit it are different claims.
+   */
+  target: number | null;
+  shortfall: number | null;
+  complete: boolean | null;
+  targetKnown: boolean;
+  why?: string;
+};
+
+export const logReceipt = (clusterId: string, b: {
+  artisanId: string; quantityReceived: number; quantityRejected?: number;
+  orderId?: string; enquiryId?: string; note?: string;
+}) => post<{ receipt: GoodsReceipt; tally: Tally }>(
+  `/v1/clusters/${clusterId}/grn`, b);
+
+export const listReceipts = (clusterId: string, p: {
+  orderId?: string; enquiryId?: string; artisanId?: string } = {}) => {
+  const qs = new URLSearchParams(
+    Object.entries(p).filter(([, v]) => !!v) as [string, string][]).toString();
+  return get<{ receipts: GoodsReceipt[]; isOwner: boolean; tally?: Tally }>(
+    `/v1/clusters/${clusterId}/grn${qs ? `?${qs}` : ''}`);
+};
+
+/** Cancel an entry. It stays on the record - a log that can be rewritten is not one. */
+export const voidReceipt = (id: string, reason: string) =>
+  post<GoodsReceipt>(`/v1/grn/${id}/void`, { reason });
+
+/* ------------------------------------------------------ password sign-in */
+
+/**
+ * The second way in, alongside the OTP.
+ *
+ * It exists because OTP delivery needs an SMS provider with credit on it, and when
+ * that is not paid for there is otherwise no way into the product at all. The OTP
+ * is still the front door: a phone number is the one credential this user already
+ * has and cannot forget.
+ */
+export const loginWithPassword = (phone: string, password: string) =>
+  post<{ ok: boolean; token: string; artisan: Artisan; claimedDrafts: number }>(
+    '/v1/auth/password',
+    { phone, password, guestToken: session.guestToken() });
+
+/** Set or change your own password. Requires being signed in already. */
+export const setPassword = (password: string) =>
+  post<{ ok: boolean; artisan: Artisan }>('/v1/auth/password/set', { password });
+
+/**
+ * Throw away a draft.
+ *
+ * Only a draft. The server refuses anything published, sold, or with an order
+ * against it, because a buyer's order pointing at a row that no longer exists is an
+ * orphan nobody can explain later.
+ */
+export const deleteListing = (id: string) =>
+  call<{ ok: boolean; id: string; title: string }>(
+    `/v1/listings/${id}`, { method: 'DELETE' });

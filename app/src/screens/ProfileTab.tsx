@@ -20,6 +20,12 @@ import * as cache from '../lib/cache';
  * environment settings belong. Nothing else on this screen exposes internals: no
  * endpoints, no tokens, no build flags.
  */
+const ROLE_OPTIONS: { key: api.Role; label: string; sub: string }[] = [
+  { key: 'artisan', label: 'role.artisan', sub: 'role.artisanSub' },
+  { key: 'solo_seller', label: 'role.solo', sub: 'role.soloSub' },
+  { key: 'cluster_creator', label: 'role.cluster', sub: 'role.clusterSub' },
+];
+
 export default function ProfileTab({
   artisan, readiness, onLanguage, onLogin, onLogout, onEditProfile, onRefresh,
 }: {
@@ -33,6 +39,22 @@ export default function ProfileTab({
 }) {
   const { t, native } = useI18n();
   const [showInsights, setShowInsights] = useState(!session.insightsHidden());
+  const [roleBusy, setRoleBusy] = useState(false);
+  const [roleErr, setRoleErr] = useState('');
+
+  const changeRole = async (role: api.Role) => {
+    if (!artisan || artisan.role === role) return;
+    setRoleBusy(true);
+    setRoleErr('');
+    try {
+      await api.setRole(role);
+      onRefresh();
+    } catch (e: any) {
+      setRoleErr(e?.message || 'Could not change this');
+    } finally {
+      setRoleBusy(false);
+    }
+  };
   const [cleared, setCleared] = useState(false);
 
   const pickup = artisan?.addresses?.find((a) => a.kind === 'pickup');
@@ -63,6 +85,44 @@ export default function ProfileTab({
             <Row label={t('auth.businessName')} value={artisan.businessName} />
           ) : null}
           <Btn label={t('prof.editProfile')} tone="ghost" onPress={onEditProfile} />
+        </Card>
+      ) : null}
+
+      {/* The role switch (addendum §10.2, edge case 11).
+          Deliberately changeable rather than fixed at signup: somebody who starts by
+          listing their own work is exactly the person who later coordinates a group.
+          Both refusals come from the server with their own wording - no GSTIN, or a
+          cluster still running - and are shown as they arrive rather than as codes. */}
+      {artisan ? (
+        <Card style={{ gap: S.md }}>
+          <Text style={[T.label, {}]}>{t('role.ask')}</Text>
+          {ROLE_OPTIONS.map(({ key, label, sub }) => {
+            const active = (artisan.role || 'artisan') === key;
+            return (
+              <Pressable key={key} onPress={() => changeRole(key)} disabled={roleBusy}>
+                <View style={{
+                  padding: S.md, borderRadius: R.lg, gap: 3,
+                  backgroundColor: active ? C.primarySoft : C.surface,
+                  borderWidth: active ? 2 : 1,
+                  borderColor: active ? C.primary : C.line,
+                  opacity: roleBusy ? 0.6 : 1,
+                }}>
+                  <View style={{ flexDirection: 'row', alignItems: 'center', gap: S.sm }}>
+                    <Text style={[T.body, { fontFamily: 'Mukta_700Bold', flex: 1 }]}>
+                      {t(label)}
+                    </Text>
+                    {active ? <Pill text="✓" tone="soft" /> : null}
+                  </View>
+                  <Text style={[T.micro, { color: C.inkSoft }]}>{t(sub)}</Text>
+                </View>
+              </Pressable>
+            );
+          })}
+          {roleErr ? (
+            <Text style={[T.micro, { color: C.danger }]}>{roleErr}</Text>
+          ) : (
+            <Text style={[T.micro, { color: C.inkSoft }]}>{t('role.change')}</Text>
+          )}
         </Card>
       ) : (
         <Card style={{ alignItems: 'center', paddingVertical: S.xl, gap: S.md }}>

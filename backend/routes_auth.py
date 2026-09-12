@@ -105,6 +105,72 @@ def otp_verify(body: OtpVerifyIn, request: Request) -> dict[str, Any]:
         s.close()
 
 
+class PasswordLoginIn(BaseModel):
+    phone: str
+    password: str
+    guestToken: str = ""
+
+
+@router.post("/v1/auth/password")
+def password_login(body: PasswordLoginIn, request: Request) -> dict[str, Any]:
+    """
+    Sign in with a phone number and a password.
+
+    The second way in, not the first. It exists because OTP delivery depends on an
+    SMS provider with credit on it, and when that fails nobody can reach the product
+    at all. Rate-limited and locked out per account in `auth.login_with_password`.
+
+    Every failure answers 401 with the same wording. Separating "no such account"
+    from "wrong password" would turn this endpoint into a way to test which phone
+    numbers are registered, and for this user base that list is a list of people.
+    """
+    s = db.session()
+    try:
+        out = auth.login_with_password(
+            s, body.phone, body.password,
+            user_agent=request.headers.get("user-agent", ""))
+        if not out.get("ok"):
+            raise HTTPException(401, out.get("message") or "sign-in failed")
+
+        # Claim any drafts made on this device before signing in, exactly as the OTP
+        # path does - work started as a guest must survive the login.
+        out["claimedDrafts"] = auth.claim_guest_drafts(
+            s, out["artisan"]["id"], body.guestToken)
+        s.commit()
+        return out
+    finally:
+        s.close()
+
+
+class SetPasswordIn(BaseModel):
+    password: str
+
+
+@router.post("/v1/auth/password/set")
+def set_password(body: SetPasswordIn,
+                 authorization: str | None = Header(None)) -> dict[str, Any]:
+    """
+    Set or change your own password. Requires being signed in already.
+
+    Deliberately not a reset flow: recovering an account you cannot get into is what
+    the OTP is for, and a password reset that mails a link needs an email address
+    this user does not have.
+    """
+    s = db.session()
+    try:
+        a = current(s, authorization)
+        if not a:
+            raise HTTPException(401, "not logged in")
+        try:
+            auth.set_password(s, a, body.password)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        s.commit()
+        return {"ok": True, "artisan": a.public()}
+    finally:
+        s.close()
+
+
 @router.get("/v1/auth/me")
 def me(authorization: str | None = Header(None)) -> dict[str, Any]:
     s = db.session()

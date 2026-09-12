@@ -31,7 +31,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel
@@ -42,9 +42,17 @@ import analytics  # noqa: E402
 import auth  # noqa: E402
 import bg  # noqa: E402
 import channels  # noqa: E402
+import clusters  # noqa: E402
 import db  # noqa: E402
+import grn  # noqa: E402
 import logistics  # noqa: E402
+import market  # noqa: E402
+import ondc  # noqa: E402
+import passport  # noqa: E402
 import seller  # noqa: E402
+import settlement  # noqa: E402
+
+log = logging.getLogger("main")
 import imaging  # noqa: E402
 import llm  # noqa: E402
 import jobs  # noqa: E402
@@ -62,6 +70,12 @@ MEDIA_DIR = os.getenv("MEDIA_DIR", "media")
 PUBLIC_BASE = os.getenv("PUBLIC_BASE_URL", "http://localhost:8000")
 os.makedirs(MEDIA_DIR, exist_ok=True)
 db.init()
+
+# create_all adds missing tables but never alters an existing one, so a column added
+# to a model after this database was created is silently absent. Checked here so it
+# is a loud warning at startup naming the fix, rather than a 500 on whichever screen
+# reads the new column first.
+db.warn_if_schema_behind()
 
 # A job left "running" belongs to a process that is no longer alive - a deploy, a
 # crash, an OOM kill. Without this it would say "working on it" forever, and the
@@ -181,6 +195,37 @@ def analyze(body: AnalyzeIn,
     try:
         me = auth.artisan_from_token(s, authorization)
         listing = s.get(db.Listing, body.listingId) if body.listingId else None
+
+        if listing is None:
+            # Idempotency, by the one thing that identifies this photograph: the hash
+            # of its bytes.
+            #
+            # The bug this fixes was ugly and hard to see. The phone uploads a draft,
+            # the server creates the listing and runs the pipeline, and the reply is
+            # lost - a tunnel restart, a dropped connection, a two-minute request on a
+            # village signal. The phone never learns the listing's id, so the draft
+            # stays unsynced and the next refresh uploads the same photograph again.
+            # The artisan ends up with the same pot listed twice, both unfinished,
+            # both nagging her from the home screen to finish them.
+            #
+            # Matching on the content hash makes the retry land on the row the first
+            # attempt created. Scoped to the owner so two artisans photographing the
+            # same product never collide, and only to rows still in progress or draft,
+            # because a second genuine listing of a re-photographed item is a real
+            # thing somebody may want.
+            raw_hash = "sha256:" + hashlib.sha256(data).hexdigest()
+            dup = s.query(db.Listing).filter(
+                db.Listing.raw_hash == raw_hash,
+                db.Listing.status.in_(("processing", "draft")))
+            dup = (dup.filter(db.Listing.artisan_id == me.id) if me else
+                   dup.filter(db.Listing.guest_token == (x_guest_token or ""),
+                              db.Listing.artisan_id.is_(None)))
+            listing = dup.order_by(db.Listing.created_at.asc()).first()
+            if listing is not None:
+                db.log_event(s, "listing", listing.id, "note",
+                             detail="same photograph uploaded again; reused this row "
+                                    "instead of creating a duplicate")
+
         if listing is None:
             # A draft belongs to the account when there is one, and otherwise to the
             # device, so guest work survives until it can be claimed at login.
@@ -471,6 +516,59 @@ def get_listing(lid: str,
                .order_by(db.Event.at.asc()).all())
         return {**lst.public(), "events": [e.public() for e in evs],
                 "views": analytics.view_count(s, lid)}
+    finally:
+        s.close()
+
+
+@app.delete("/v1/listings/{lid}")
+def delete_listing(lid: str, authorization: str | None = Header(None),
+                   x_guest_token: str | None = Header(None)) -> dict[str, Any]:
+    """
+    Throw away a draft.
+
+    Deliberately narrow. A draft is work in progress and hers to discard, but a
+    listing that has been published or sold is a record other people depend on - a
+    buyer's order points at it, a marketplace has its id, and a settlement divides
+    money by it. Those are refused with the reason rather than deleted, because the
+    row disappearing is how an order becomes an orphan nobody can explain.
+
+    The event log goes with it. Keeping the history of a listing that no longer
+    exists serves nobody, and an artisan who discards a photograph expects it gone.
+    """
+    s = db.session()
+    try:
+        lst, _me = _own_listing(s, lid, authorization, x_guest_token)
+
+        if (lst.status or "") not in ("draft", "processing", "failed"):
+            raise HTTPException(409, detail={
+                "error": "not_a_draft",
+                "why": f"This product is {lst.status}, not a draft. Published work "
+                       f"cannot be deleted here - take it off sale instead."})
+
+        n_orders = s.query(db.Order).filter(db.Order.listing_id == lid).count()
+        if n_orders:
+            raise HTTPException(409, detail={
+                "error": "has_orders",
+                "why": f"Somebody has ordered this ({n_orders} order(s)), so it "
+                       f"cannot be deleted."})
+
+        pubs = s.query(db.Publication).filter(db.Publication.listing_id == lid).all()
+        live = [p for p in pubs if p.status in ("published", "processing")]
+        if live:
+            raise HTTPException(409, detail={
+                "error": "is_published",
+                "why": "This is live on " + ", ".join(p.channel for p in live)
+                       + ". Take it off sale there first."})
+
+        title = lst.title_en or lst.title_hi or lid
+        s.query(db.Publication).filter(db.Publication.listing_id == lid).delete()
+        s.query(db.ListingView).filter(db.ListingView.listing_id == lid).delete()
+        s.query(db.Enquiry).filter(db.Enquiry.listing_id == lid).delete()
+        s.query(db.Event).filter(db.Event.subject_type == "listing",
+                                 db.Event.subject_id == lid).delete()
+        s.delete(lst)
+        s.commit()
+        return {"ok": True, "id": lid, "title": title}
     finally:
         s.close()
 
@@ -775,7 +873,13 @@ def storefront_page(lid: str, request: Request) -> str:
    font-size:17px;font-weight:700;cursor:pointer}}
  button[disabled]{{background:#B9B3C6;cursor:not-allowed}}
  .ok{{background:#E3F3EC;border:1px solid #0B7A54;padding:16px;border-radius:14px;margin-top:16px}}
-</style></head><body><div class="wrap">
+ .test{{background:#FBF2DC;border:1px solid #EFDFB4;padding:12px 14px;border-radius:12px;
+   font-size:13.5px;color:#4A4468;margin-top:14px}}
+</style>
+<script src="https://checkout.razorpay.com/v1/checkout.js"></script>
+</head><body><div class="wrap">
+<p style="margin:0 0 14px"><a href="/market" style="color:#A93C12;text-decoration:none;
+  font-weight:700">&#8592; All handmade pieces</a></p>
 <img src="{e(d['imageUrl'])}" alt="{title}">
 <h1>{title}</h1>
 <div class="price">₹{d['price']:,.0f}</div>
@@ -786,6 +890,7 @@ def storefront_page(lid: str, request: Request) -> str:
 <table>{attrs}</table>
 <form id="f">
   <h3 style="margin:0 0 10px">{'Sold out' if sold_out else 'Buy this piece'}</h3>
+  {'<div class="test"><b>Test mode.</b> The checkout is genuine Razorpay, but no real money moves. Use card <b>4111 1111 1111 1111</b>, any future expiry, any CVV.</div>' if os.getenv('RAZORPAY_KEY_ID', '').startswith('rzp_test') else ''}
   <input name="buyerName" placeholder="Your name" required>
   <input name="buyerPhone" placeholder="Phone number" required>
   <input name="buyerEmail" type="email" placeholder="Email (optional)">
@@ -822,7 +927,55 @@ document.getElementById('f').addEventListener('submit', async (ev) => {{
   const j = await r.json();
   if (!r.ok) {{ btn.disabled=false; btn.textContent='Try again'; alert(j.detail||'failed'); return; }}
   ev.target.style.display='none';
-  document.getElementById('done').innerHTML =
+  const done = document.getElementById('done');
+
+  // Razorpay first when it is configured. This is the real checkout, not a
+  // stand-in: real order objects, real signatures, the same code path production
+  // runs. In test mode the only difference is that the money does not exist.
+  if (j.razorpayOrderId && j.razorpayKeyId) {{
+    done.innerHTML = '<div class="ok">Opening payment…</div>';
+    const rz = new Razorpay({{
+      key: j.razorpayKeyId,
+      order_id: j.razorpayOrderId,
+      amount: Math.round(j.amount * 100),
+      currency: 'INR',
+      name: 'Kalakriti',
+      description: {json.dumps(title)},
+      prefill: {{ name: fd.buyerName, contact: fd.buyerPhone, email: fd.buyerEmail }},
+      theme: {{ color: '#D4541F' }},
+      handler: async (res) => {{
+        // Confirm server-side before telling anybody it worked. The browser
+        // saying "paid" is not evidence; the signature checked against our
+        // secret, and Razorpay's own record of the amount, are.
+        const v = await fetch('/v1/orders/' + j.id + '/payment', {{
+          method: 'POST', headers: {{'Content-Type':'application/json'}},
+          body: JSON.stringify({{
+            razorpayOrderId: res.razorpay_order_id,
+            razorpayPaymentId: res.razorpay_payment_id,
+            signature: res.razorpay_signature }})}});
+        const vj = await v.json();
+        done.innerHTML = v.ok
+          ? '<div class="ok"><b>Paid.</b><br>Order ' + j.id +
+            '<br>Payment ' + vj.paymentId +
+            '<br><br>The maker can see this order in their app now.</div>'
+          : '<div class="ok" style="background:#FCEBE9;border-color:#B3261E">' +
+            '<b>Payment could not be confirmed.</b><br>' +
+            ((vj.detail && vj.detail.why) || 'Please contact the seller.') + '</div>';
+      }},
+      modal: {{ ondismiss: () => {{
+        done.innerHTML = '<div class="ok"><b>Order ' + j.id +
+          ' is held, unpaid.</b><br>Reopen this page to try paying again.</div>';
+      }} }},
+    }});
+    rz.on('payment.failed', (res) => {{
+      done.innerHTML = '<div class="ok" style="background:#FCEBE9;border-color:#B3261E">' +
+        '<b>Payment failed.</b><br>' + ((res.error && res.error.description) || '') + '</div>';
+    }});
+    rz.open();
+    return;
+  }}
+
+  done.innerHTML =
     '<div class="ok"><b>Order ' + j.id + ' created.</b><br>Status: ' + j.status +
     '<br>Payment: ' + j.paymentStatus +
     (j.payLink ? '<br><br><a href="'+j.payLink+'">Pay ₹' + j.amount + ' via UPI</a>' : '') +
@@ -1091,46 +1244,59 @@ class PassportIn(BaseModel):
     rawHash: str
     ops: list[str] = []
     artisanId: str
+    listingId: str | None = None
     giTag: str | None = "GI-99 Banaras Brocades & Sarees"
     geo: str | None = "25.3176 N, 82.9739 E - Varanasi cluster"
 
 
-_KEY_PATH = os.getenv("PASSPORT_KEY_PATH", "passport_key.pem")
-
-
-def _signing_key():
-    from cryptography.hazmat.primitives import serialization
-    from cryptography.hazmat.primitives.asymmetric import ed25519
-
-    if os.path.exists(_KEY_PATH):
-        with open(_KEY_PATH, "rb") as f:
-            return serialization.load_pem_private_key(f.read(), password=None)
-    key = ed25519.Ed25519PrivateKey.generate()
-    with open(_KEY_PATH, "wb") as f:
-        f.write(key.private_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PrivateFormat.PKCS8,
-            encryption_algorithm=serialization.NoEncryption()))
-    return key
-
-
 @app.post("/v1/passport")
-def passport(body: PassportIn) -> dict[str, Any]:
-    from cryptography.hazmat.primitives import serialization
+def mint_passport(body: PassportIn) -> dict[str, Any]:
+    """
+    Mint a Provenance Passport, and keep it.
 
-    key = _signing_key()
-    claims = {"artisanId": body.artisanId, "giTag": body.giTag, "geo": body.geo,
-              "rawHash": body.rawHash, "enhanceOps": body.ops,
-              "capturedAt": datetime.now(timezone.utc).isoformat()}
-    payload = json.dumps(claims, sort_keys=True, separators=(",", ":")).encode()
-    sig = key.sign(payload)
-    pub = key.public_key().public_bytes(encoding=serialization.Encoding.Raw,
-                                        format=serialization.PublicFormat.Raw)
-    return {**claims,
-            "id": f"KK-BNS-{datetime.now().year}-"
-                  f"{hashlib.sha256(payload).hexdigest()[:10].upper()}",
-            "signature": "ed25519:" + base64.b64encode(sig).decode(),
-            "publicKey": "ed25519:" + base64.b64encode(pub).decode()}
+    This used to sign a set of claims, return them once and forget them, so the QR
+    code printed on a finished product referred to a record held nowhere. With
+    `listingId` the passport is written to the listing and /passport/{id} opens months
+    later, in any browser, with no app installed.
+    """
+    s = db.session()
+    try:
+        return passport.mint(s, raw_hash=body.rawHash, ops=body.ops,
+                             artisan_id=body.artisanId, listing_id=body.listingId,
+                             gi_tag=body.giTag, geo=body.geo)
+    finally:
+        s.close()
+
+
+@app.get("/passport/{pid}/pubkey")
+def passport_pubkey(pid: str) -> dict[str, Any]:
+    """
+    The public key, the signature and the signed bytes, published openly.
+
+    The addendum's argument for an open standard is that a third party can check the
+    claim independently. That is only true if all three are downloadable.
+    """
+    s = db.session()
+    try:
+        doc = passport.pubkey_doc(s, pid)
+        if not doc:
+            raise HTTPException(404, "no such passport")
+        return doc
+    finally:
+        s.close()
+
+
+@app.get("/passport/{pid}", response_class=HTMLResponse)
+def passport_page(pid: str) -> str:
+    """The public verification page behind every passport QR code."""
+    s = db.session()
+    try:
+        out = passport.page(s, pid)
+        if out is None:
+            raise HTTPException(404, "no such passport")
+        return out
+    finally:
+        s.close()
 
 
 # The /v1/trends endpoint was removed here.
@@ -1292,7 +1458,768 @@ def marketplace_support() -> dict[str, Any]:
     return {"support": channels.metric_support(), "metrics": channels.METRICS}
 
 
-# ═════════════════════════════════ 8. slow connections: jobs and field assist
+# ════════════════════════════════════════════ 8. clusters: the cooperative model
+#
+# A marketplace will not accept a seller without GST, PAN and a bank account, and the
+# artisans this app exists for do not have them. A cluster is how they sell anyway:
+# one GST-holding member becomes the seller of record for the group and is paid a
+# coordination commission for carrying that liability.
+#
+# The rules that make this trustworthy rather than a better-dressed middleman live in
+# `clusters.py`, not in these handlers. This layer only translates HTTP to that.
+
+def _need_artisan(s, authorization: str | None) -> db.Artisan:
+    me = auth.artisan_from_token(s, authorization)
+    if me is None:
+        raise HTTPException(401, "sign in first")
+    return me
+
+
+def _cluster_error(e: clusters.ClusterError) -> HTTPException:
+    """
+    A refusal the artisan can act on, carrying its own explanation.
+
+    409 rather than 400 for the ones that are about state rather than input - a full
+    capacity book or an already-owned cluster is not a malformed request, and the app
+    renders the two differently.
+    """
+    state_codes = {"insufficient_capacity", "owns_active_cluster",
+                   "owner_cannot_join", "not_a_member"}
+    status = 409 if e.code in state_codes else 400
+    if e.code in ("cluster_not_found", "bad_invite_code", "receipt_not_found",
+                  "artisan_not_found"):
+        status = 404
+    # Not an argument about the request, which is well formed - an argument about
+    # who is making it. A member asking to write their own goods receipt is refused
+    # for the same reason they cannot write their own payslip.
+    if e.code == "not_cluster_owner":
+        status = 403
+    return HTTPException(status, detail=e.payload())
+
+
+class ClusterIn(BaseModel):
+    name: str
+    craftCategory: str = ""
+    commissionPct: float = 0
+    maxOrderUnits: int = 0
+    district: str = ""
+    state: str = ""
+
+
+@app.post("/v1/clusters")
+def create_cluster(body: ClusterIn,
+                   authorization: str | None = Header(None)) -> dict[str, Any]:
+    """Create a cluster. Requires a GSTIN, because the owner is named on the invoice."""
+    s = db.session()
+    try:
+        me = _need_artisan(s, authorization)
+        try:
+            c = clusters.create_cluster(
+                s, me, name=body.name, craft_category=body.craftCategory,
+                commission_pct=body.commissionPct,
+                max_order_units=body.maxOrderUnits,
+                district=body.district, state=body.state)
+        except clusters.ClusterError as e:
+            raise _cluster_error(e)
+        s.commit()
+        return clusters.card(s, c, me)
+    finally:
+        s.close()
+
+
+@app.get("/v1/clusters")
+def list_clusters(craftCategory: str = "", district: str = "", state: str = "",
+                  q: str = "", mine: bool = False, limit: int = 50,
+                  authorization: str | None = Header(None)) -> dict[str, Any]:
+    """
+    Browse open clusters, or list the caller's own memberships with `mine=true`.
+
+    Readable without signing in. Somebody deciding whether this app is worth creating
+    an account for should be able to see what joining would actually mean first.
+    """
+    s = db.session()
+    try:
+        me = auth.artisan_from_token(s, authorization)
+        if mine:
+            if me is None:
+                raise HTTPException(401, "sign in first")
+            return {"clusters": clusters.memberships_of(s, me),
+                    "owned": [clusters.card(s, c, me) for c in
+                              s.query(db.Cluster)
+                              .filter(db.Cluster.owner_artisan_id == me.id).all()]}
+        return {"clusters": clusters.browse(s, me, craft_category=craftCategory,
+                                            district=district, state=state,
+                                            query=q, limit=limit)}
+    finally:
+        s.close()
+
+
+@app.get("/v1/clusters/{cid}")
+def get_cluster(cid: str,
+                authorization: str | None = Header(None)) -> dict[str, Any]:
+    """One cluster's full terms. The owner additionally sees the member list."""
+    s = db.session()
+    try:
+        me = auth.artisan_from_token(s, authorization)
+        c = s.get(db.Cluster, cid)
+        if c is None:
+            raise HTTPException(404, "cluster not found")
+        out = clusters.card(s, c, me)
+        if me is not None and c.owner_artisan_id == me.id:
+            out["members"] = [
+                {**m.public(),
+                 "name": (m.artisan.full_name or m.artisan.business_name or "")
+                         if m.artisan else "",
+                 "phone": m.artisan.phone if m.artisan else "",
+                 "capacityUnits": m.artisan.capacity_units if m.artisan else 0,
+                 "capacityAvailable": m.artisan.capacity_available if m.artisan else 0}
+                for m in (c.memberships or [])]
+        return out
+    finally:
+        s.close()
+
+
+@app.get("/v1/clusters/by-code/{code}")
+def cluster_by_code(code: str,
+                    authorization: str | None = Header(None)) -> dict[str, Any]:
+    """
+    Resolve an invite code to a cluster's terms, before joining.
+
+    Separate from join on purpose: scanning a QR code should show somebody what they
+    are about to agree to, not enrol them in it.
+    """
+    s = db.session()
+    try:
+        me = auth.artisan_from_token(s, authorization)
+        c = clusters.by_code(s, code)
+        if c is None:
+            raise HTTPException(404, detail={
+                "error": "bad_invite_code",
+                "why": "No cluster has that code. Check it with whoever gave it to you."})
+        return clusters.card(s, c, me)
+    finally:
+        s.close()
+
+
+class JoinIn(BaseModel):
+    inviteCode: str = ""
+
+
+@app.post("/v1/clusters/{cid}/join")
+def join_cluster(cid: str, body: JoinIn | None = None,
+                 authorization: str | None = Header(None)) -> dict[str, Any]:
+    s = db.session()
+    try:
+        me = _need_artisan(s, authorization)
+        code = (body.inviteCode if body else "") or ""
+        try:
+            m = clusters.join(s, me, cluster_id=cid, invite_code=code)
+        except clusters.ClusterError as e:
+            raise _cluster_error(e)
+        s.commit()
+        c = s.get(db.Cluster, m.cluster_id)
+        return {"membership": m.public(), "cluster": clusters.card(s, c, me)}
+    finally:
+        s.close()
+
+
+@app.post("/v1/clusters/join")
+def join_cluster_by_code(body: JoinIn,
+                         authorization: str | None = Header(None)) -> dict[str, Any]:
+    """Join with only a code, for somebody onboarded in person with no id to hand."""
+    s = db.session()
+    try:
+        me = _need_artisan(s, authorization)
+        try:
+            m = clusters.join(s, me, invite_code=body.inviteCode)
+        except clusters.ClusterError as e:
+            raise _cluster_error(e)
+        s.commit()
+        c = s.get(db.Cluster, m.cluster_id)
+        return {"membership": m.public(), "cluster": clusters.card(s, c, me)}
+    finally:
+        s.close()
+
+
+@app.post("/v1/clusters/{cid}/leave")
+def leave_cluster(cid: str,
+                  authorization: str | None = Header(None)) -> dict[str, Any]:
+    s = db.session()
+    try:
+        me = _need_artisan(s, authorization)
+        try:
+            m = clusters.leave(s, me, cid)
+        except clusters.ClusterError as e:
+            raise _cluster_error(e)
+        s.commit()
+        return m.public()
+    finally:
+        s.close()
+
+
+class RoleIn(BaseModel):
+    role: str
+
+
+@app.patch("/v1/me/role")
+def set_my_role(body: RoleIn,
+                authorization: str | None = Header(None)) -> dict[str, Any]:
+    """
+    The Solo Seller / Cluster Creator switch from addendum §10.2, both directions.
+
+    Changeable later rather than fixed at signup, because somebody who starts by
+    listing their own work is exactly the person who later coordinates a cluster.
+    """
+    s = db.session()
+    try:
+        me = _need_artisan(s, authorization)
+        try:
+            clusters.set_role(s, me, body.role)
+        except clusters.ClusterError as e:
+            raise _cluster_error(e)
+        s.commit()
+        return me.public()
+    finally:
+        s.close()
+
+
+class CapacityIn(BaseModel):
+    units: int
+    clusterId: str = ""
+    reason: str = ""
+
+
+@app.patch("/v1/me/capacity")
+def set_my_capacity(body: CapacityIn,
+                    authorization: str | None = Header(None)) -> dict[str, Any]:
+    """How many units this artisan can make in a cycle. One number per person."""
+    s = db.session()
+    try:
+        me = _need_artisan(s, authorization)
+        units = int(body.units or 0)
+        if units < 0:
+            raise HTTPException(400, "capacity cannot be negative")
+        if units < (me.capacity_committed or 0):
+            raise HTTPException(409, detail={
+                "error": "below_committed",
+                "why": f"You have already promised {me.capacity_committed} unit(s). "
+                       f"Capacity cannot be set below work already committed."})
+        me.capacity_units = units
+        s.commit()
+        return me.public()
+    finally:
+        s.close()
+
+
+@app.post("/v1/me/capacity/commit")
+def commit_my_capacity(body: CapacityIn,
+                       authorization: str | None = Header(None)) -> dict[str, Any]:
+    """
+    Reserve capacity against an accepted order.
+
+    The counter lives on the artisan, not the membership, so two clusters in the same
+    craft cannot both be promised the same weeks - addendum §11, cases 1 and 2.
+    """
+    s = db.session()
+    try:
+        me = _need_artisan(s, authorization)
+        try:
+            out = clusters.commit_capacity(s, me, body.units,
+                                           cluster_id=body.clusterId,
+                                           reason=body.reason)
+        except clusters.ClusterError as e:
+            raise _cluster_error(e)
+        s.commit()
+        return out
+    finally:
+        s.close()
+
+
+@app.post("/v1/me/capacity/release")
+def release_my_capacity(body: CapacityIn,
+                        authorization: str | None = Header(None)) -> dict[str, Any]:
+    s = db.session()
+    try:
+        me = _need_artisan(s, authorization)
+        try:
+            out = clusters.release_capacity(s, me, body.units, body.reason)
+        except clusters.ClusterError as e:
+            raise _cluster_error(e)
+        s.commit()
+        return out
+    finally:
+        s.close()
+
+
+class ReviewIn(BaseModel):
+    settlementId: str = ""
+    paidOnTime: int = 0
+    commissionFair: int = 0
+    ordersRegular: int = 0
+    note: str = ""
+
+
+@app.get("/v1/clusters/{cid}/reviews")
+def list_reviews(cid: str,
+                 authorization: str | None = Header(None)) -> dict[str, Any]:
+    """
+    What members say, and whether the caller may add to it.
+
+    Readable without signing in, because the whole point of a rating is that somebody
+    deciding where to send months of work can read it before committing.
+    """
+    s = db.session()
+    try:
+        me = auth.artisan_from_token(s, authorization)
+        c = s.get(db.Cluster, cid)
+        if c is None:
+            raise HTTPException(404, "cluster not found")
+        out: dict[str, Any] = {
+            "reviews": clusters.reviews_for(s, cid),
+            "rating": clusters.rating(s, c),
+        }
+        if me is not None:
+            out["eligibility"] = clusters.review_eligibility(s, me, cid)
+        return out
+    finally:
+        s.close()
+
+
+@app.post("/v1/clusters/{cid}/reviews")
+def add_review(cid: str, body: ReviewIn,
+               authorization: str | None = Header(None)) -> dict[str, Any]:
+    """
+    Leave a review. Only possible once this cluster has actually paid you.
+
+    Enforced here rather than in the app, because a rule that lives only in a screen
+    is not a rule - and this particular rule is the one that makes the rating worth
+    reading at all.
+    """
+    s = db.session()
+    try:
+        me = _need_artisan(s, authorization)
+        try:
+            r = clusters.add_review(
+                s, me, cid, settlement_id=body.settlementId,
+                paid_on_time=body.paidOnTime, commission_fair=body.commissionFair,
+                orders_regular=body.ordersRegular, note=body.note)
+        except clusters.ClusterError as e:
+            raise _cluster_error(e)
+        s.commit()
+        c = s.get(db.Cluster, cid)
+        return {"review": r.public(), "rating": clusters.rating(s, c)}
+    finally:
+        s.close()
+
+
+class GrnIn(BaseModel):
+    artisanId: str
+    quantityReceived: int
+    quantityRejected: int = 0
+    orderId: str = ""
+    enquiryId: str = ""
+    note: str = ""
+
+
+@app.post("/v1/clusters/{cid}/grn")
+def log_grn(cid: str, body: GrnIn,
+            authorization: str | None = Header(None)) -> dict[str, Any]:
+    """
+    Record what an artisan physically delivered to the dispatch point.
+
+    This is what settlement reads. Not the commitment, not the order quantity - what
+    arrived and passed inspection, which is usually a different number and is the
+    only one anybody should be paid against.
+    """
+    s = db.session()
+    try:
+        me = _need_artisan(s, authorization)
+        try:
+            g = grn.log_receipt(s, me, cluster_id=cid, artisan_id=body.artisanId,
+                                quantity_received=body.quantityReceived,
+                                quantity_rejected=body.quantityRejected,
+                                order_id=body.orderId, enquiry_id=body.enquiryId,
+                                note=body.note)
+        except clusters.ClusterError as e:
+            raise _cluster_error(e)
+        s.commit()
+        return {"receipt": g.public(),
+                "tally": grn.tally(s, cid, order_id=body.orderId,
+                                   enquiry_id=body.enquiryId)}
+    finally:
+        s.close()
+
+
+@app.get("/v1/clusters/{cid}/grn")
+def list_grn(cid: str, orderId: str = "", enquiryId: str = "", artisanId: str = "",
+             authorization: str | None = Header(None)) -> dict[str, Any]:
+    """
+    Receipts and the running tally.
+
+    The owner sees everything. A member sees only their own rows - what another
+    artisan delivered, and whether any of it was rejected, is not theirs to read.
+    """
+    s = db.session()
+    try:
+        me = _need_artisan(s, authorization)
+        c = s.get(db.Cluster, cid)
+        if c is None:
+            raise HTTPException(404, "cluster not found")
+
+        is_owner = c.owner_artisan_id == me.id
+        if not is_owner:
+            member = (s.query(db.ClusterMembership)
+                      .filter(db.ClusterMembership.cluster_id == cid,
+                              db.ClusterMembership.artisan_id == me.id).first())
+            if member is None:
+                raise HTTPException(403, "not your cluster")
+            artisanId = me.id          # narrowed to themselves, whatever was asked
+
+        rows = grn.receipts(s, cid, order_id=orderId, enquiry_id=enquiryId,
+                            artisan_id=artisanId)
+        out: dict[str, Any] = {"receipts": [g.public() for g in rows],
+                               "isOwner": is_owner}
+        if is_owner:
+            out["tally"] = grn.tally(s, cid, order_id=orderId, enquiry_id=enquiryId)
+        return out
+    finally:
+        s.close()
+
+
+class VoidIn(BaseModel):
+    reason: str = ""
+
+
+@app.post("/v1/grn/{gid}/void")
+def void_grn(gid: str, body: VoidIn,
+             authorization: str | None = Header(None)) -> dict[str, Any]:
+    """
+    Mark a receipt void. It is kept, not deleted - a settlement dispute is resolved
+    by reading the log, and a log that can be quietly rewritten resolves nothing.
+    """
+    s = db.session()
+    try:
+        me = _need_artisan(s, authorization)
+        try:
+            g = grn.void_receipt(s, me, gid, body.reason)
+        except clusters.ClusterError as e:
+            raise _cluster_error(e)
+        s.commit()
+        return g.public()
+    finally:
+        s.close()
+
+
+class SettleIn(BaseModel):
+    orderId: str
+    platformFee: float | None = None
+    logisticsFee: float | None = None
+    gstRate: float | None = None
+
+
+@app.post("/v1/clusters/{cid}/settlements")
+def compute_settlement(cid: str, body: SettleIn,
+                       authorization: str | None = Header(None)) -> dict[str, Any]:
+    """
+    Work out what everyone is owed on one order.
+
+    Only the cluster owner may run this, for the same reason only they may log a
+    goods receipt: they are the seller of record, and this decides who is paid what.
+
+    A settlement that cannot be completed comes back with status `needs_input` and a
+    note naming the missing figure, rather than a number somebody guessed.
+    """
+    s = db.session()
+    try:
+        me = _need_artisan(s, authorization)
+        c = s.get(db.Cluster, cid)
+        if c is None:
+            raise HTTPException(404, "cluster not found")
+        if c.owner_artisan_id != me.id:
+            raise HTTPException(403, detail={
+                "error": "not_cluster_owner",
+                "why": "Only the person who runs this cluster can settle its orders."})
+        try:
+            st = settlement.compute(s, body.orderId, cid,
+                                    platform_fee_override=body.platformFee,
+                                    logistics_fee_override=body.logisticsFee,
+                                    gst_rate_override=body.gstRate)
+        except clusters.ClusterError as e:
+            raise _cluster_error(e)
+        s.commit()
+        return settlement.explain(s, st)
+    finally:
+        s.close()
+
+
+@app.get("/v1/clusters/{cid}/settlements")
+def list_settlements(cid: str,
+                     authorization: str | None = Header(None)) -> dict[str, Any]:
+    """
+    Settlements for this cluster.
+
+    The owner sees all of them in full. A member sees only their own line on each -
+    what another artisan was paid is not theirs to read, and the cluster's commission
+    is between the owner and the whole group rather than a per-member disclosure.
+    """
+    s = db.session()
+    try:
+        me = _need_artisan(s, authorization)
+        c = s.get(db.Cluster, cid)
+        if c is None:
+            raise HTTPException(404, "cluster not found")
+        is_owner = c.owner_artisan_id == me.id
+        if not is_owner:
+            member = (s.query(db.ClusterMembership)
+                      .filter(db.ClusterMembership.cluster_id == cid,
+                              db.ClusterMembership.artisan_id == me.id).first())
+            if member is None:
+                raise HTTPException(403, "not your cluster")
+
+        rows = (s.query(db.Settlement)
+                .filter(db.Settlement.cluster_id == cid)
+                .order_by(db.Settlement.created_at.desc()).all())
+        out = []
+        for st in rows:
+            full = settlement.explain(s, st)
+            if is_owner:
+                out.append(full)
+                continue
+            mine = [p for p in full["payees"] if p["artisanId"] == me.id]
+            if not mine:
+                continue
+            out.append({"id": full["id"], "orderId": full["orderId"],
+                        "status": full["status"], "computedAt": full["computedAt"],
+                        "payees": mine})
+        return {"settlements": out, "isOwner": is_owner}
+    finally:
+        s.close()
+
+
+@app.get("/v1/listings/{lid}/take-home")
+def take_home(lid: str, clusterId: str = "", quantity: int = 1,
+              authorization: str | None = Header(None)) -> dict[str, Any]:
+    """
+    What the artisan would actually keep at this listing's price.
+
+    The Fair-Floor promise is dishonest if the number shown is the sticker price, so
+    this exists to sit beside it. Deductions that cannot be known before a sale are
+    reported as unknown and the estimate is marked incomplete, never folded in as
+    zero.
+    """
+    s = db.session()
+    try:
+        me = auth.artisan_from_token(s, authorization)
+        lst = s.get(db.Listing, lid)
+        if lst is None:
+            raise HTTPException(404, "listing not found")
+
+        cluster = s.get(db.Cluster, clusterId) if clusterId else None
+        if cluster is None and me is not None:
+            m = (s.query(db.ClusterMembership)
+                 .filter(db.ClusterMembership.artisan_id == me.id,
+                         db.ClusterMembership.status == "active").first())
+            cluster = s.get(db.Cluster, m.cluster_id) if m else None
+        if cluster is None:
+            raise HTTPException(400, detail={
+                "error": "no_cluster",
+                "why": "This estimate depends on a cluster's commission, and no "
+                       "cluster was given or found for you."})
+        return settlement.quote_for_artisan(s, lst, cluster, quantity)
+    finally:
+        s.close()
+
+
+# ═══════════════════════════════════════════════ 8b. our own marketplace
+#
+# The one channel nobody has to approve. Amazon, Flipkart, GeM and ONDC all need a
+# GST number before a seller account can exist, so for a demo they cannot be live
+# however correct the integration is. This is the shop we own: every listing an
+# artisan publishes appears here, and a buyer can actually complete a purchase.
+
+@app.get("/market", response_class=HTMLResponse)
+def market_page(q: str = "", category: str = "") -> str:
+    """The shop front, server-rendered so it opens on any phone or laptop."""
+    s = db.session()
+    try:
+        return market.page(s, q=q, category=category)
+    finally:
+        s.close()
+
+
+@app.get("/v1/market")
+def market_api(q: str = "", category: str = "", limit: int = 60) -> dict[str, Any]:
+    """The same shop as JSON, for a buyer view inside the app."""
+    s = db.session()
+    try:
+        return {"items": market.listings(s, q=q, category=category, limit=limit),
+                "categories": market.categories(s),
+                "testMode": os.getenv("RAZORPAY_KEY_ID", "").startswith("rzp_test")}
+    finally:
+        s.close()
+
+
+class PaymentIn(BaseModel):
+    razorpayOrderId: str
+    razorpayPaymentId: str
+    signature: str
+
+
+@app.post("/v1/orders/{oid}/payment")
+def confirm_payment(oid: str, body: PaymentIn) -> dict[str, Any]:
+    """
+    Confirm a payment from the checkout that just completed.
+
+    This is what makes a demo work without a webhook. Razorpay's webhook needs a
+    public URL it can reach, and it is the right long-term backstop for a buyer who
+    pays and then closes the browser - but the buyer who stays on the page can be
+    confirmed here and now, from the signed response their own checkout returned.
+
+    Not trusted blindly: `market.verify_payment` checks the signature against our
+    secret and then asks Razorpay what it thinks the payment was for, because a
+    valid signature on a one-rupee payment is still a valid signature.
+    """
+    s = db.session()
+    try:
+        order = s.get(db.Order, oid)
+        if order is None:
+            raise HTTPException(404, "order not found")
+        out = market.verify_payment(
+            s, order,
+            razorpay_order_id=body.razorpayOrderId,
+            razorpay_payment_id=body.razorpayPaymentId,
+            signature=body.signature)
+        if not out.get("ok"):
+            raise HTTPException(400, detail=out)
+        return out
+    finally:
+        s.close()
+
+
+# ═══════════════════════════════════════ 9. ONDC: the Seller App (BPP) endpoints
+#
+# These are not webhooks. On ONDC we are a BPP and buyer apps call us, so this is the
+# public surface of the network - `/search` is a stranger's app browsing, `/confirm`
+# is a stranger's app telling us somebody paid.
+#
+# Every one of them answers immediately with a bare ACK and does the real work in the
+# background, because that is what Beckn requires: the substantive answer goes back
+# as a separate POST to the buyer app's own `bap_uri`. Holding the connection open to
+# reply properly is the most common way a BPP gets marked unreliable on the network.
+
+def _ondc_dispatch(handler, body: dict) -> None:
+    """
+    Run one Beckn action and post the callback, on a worker thread.
+
+    Its own session, because it outlives the request that started it. Exceptions are
+    logged and swallowed: a handler that raises must not take the process with it,
+    and the buyer app will re-ask with `/status` if nothing arrives.
+    """
+    s = db.session()
+    try:
+        handler(s, body)
+    except Exception as e:                                  # noqa: BLE001
+        log.exception("ondc handler %s failed: %s", getattr(handler, "__name__", "?"), e)
+    finally:
+        s.close()
+
+
+async def _ondc_action(request: Request, handler, tasks: BackgroundTasks) -> dict:
+    """Shared shape for every Beckn action: record it, ACK, then work."""
+    try:
+        body = await request.json()
+    except Exception:                                       # noqa: BLE001
+        return ondc.nack("30000", "Body is not JSON.")
+
+    if ondc.configured():
+        return ondc.nack("30000", "This seller platform is not registered on ONDC yet.")
+
+    ctx = body.get("context") or {}
+    s = db.session()
+    try:
+        db.log_event(s, "ondc", ctx.get("transaction_id", "") or "-",
+                     "inbound", detail=ctx.get("action", ""), payload=body)
+        s.commit()
+    finally:
+        s.close()
+
+    # A NACK has to be decided synchronously - refusing an order after ACKing it is
+    # not something the protocol gives us a way to say.
+    if handler in (ondc.handle_select, ondc.handle_init, ondc.handle_confirm,
+                   ondc.handle_status, ondc.handle_cancel):
+        s = db.session()
+        try:
+            out = handler(s, body)
+        except Exception as e:                              # noqa: BLE001
+            log.exception("ondc %s failed: %s", ctx.get("action"), e)
+            s.close()
+            return ondc.nack("30000", "Could not process that request.")
+        s.close()
+        if isinstance(out, dict) and "nack" in out:
+            return out["nack"]
+        return ondc.ack()
+
+    tasks.add_task(_ondc_dispatch, handler, body)
+    return ondc.ack()
+
+
+@app.post("/ondc/search")
+async def ondc_search(request: Request, tasks: BackgroundTasks) -> dict[str, Any]:
+    """A buyer app browsing. The catalogue goes back as `on_search`."""
+    return await _ondc_action(request, ondc.handle_search, tasks)
+
+
+@app.post("/ondc/select")
+async def ondc_select(request: Request, tasks: BackgroundTasks) -> dict[str, Any]:
+    """What would this cost. Answered with a quote built from `Listing.price`."""
+    return await _ondc_action(request, ondc.handle_select, tasks)
+
+
+@app.post("/ondc/init")
+async def ondc_init(request: Request, tasks: BackgroundTasks) -> dict[str, Any]:
+    """Terms and billing. Still not a sale."""
+    return await _ondc_action(request, ondc.handle_init, tasks)
+
+
+@app.post("/ondc/confirm")
+async def ondc_confirm(request: Request, tasks: BackgroundTasks) -> dict[str, Any]:
+    """
+    The sale. This writes the Order row that shows up in the artisan's Orders tab.
+    """
+    return await _ondc_action(request, ondc.handle_confirm, tasks)
+
+
+@app.post("/ondc/status")
+async def ondc_status(request: Request, tasks: BackgroundTasks) -> dict[str, Any]:
+    return await _ondc_action(request, ondc.handle_status, tasks)
+
+
+@app.post("/ondc/cancel")
+async def ondc_cancel(request: Request, tasks: BackgroundTasks) -> dict[str, Any]:
+    return await _ondc_action(request, ondc.handle_cancel, tasks)
+
+
+@app.get("/ondc-site-verification.html", response_class=HTMLResponse)
+def ondc_site_verification() -> str:
+    """
+    Proof to the ONDC registry that we control this domain.
+
+    The registry hands out a request id at subscription time; we sign it with the
+    same Ed25519 key and serve the signature here, and the registry fetches this page
+    to check it. Without it the subscription is never approved and nothing else in
+    this section is reachable.
+    """
+    req_id = os.getenv("ONDC_REQUEST_ID", "")
+    if not req_id or ondc.configured():
+        return ("<html><body>ONDC_REQUEST_ID is not set, so this page cannot be "
+                "signed yet.</body></html>")
+    signed = base64.b64encode(
+        ondc._priv_key().sign(req_id.encode())).decode()
+    return (f'<html><head><meta name="ondc-site-verification" '
+            f'content="{signed}"/></head><body>ONDC Site Verification Page</body></html>')
+
+
+# ═════════════════════════════════ 10. slow connections: jobs and field assist
 #
 # Two ways to make a listing, chosen by the artisan, because the right answer depends
 # on a connection we cannot see from here.

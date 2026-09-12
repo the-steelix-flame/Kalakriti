@@ -237,6 +237,26 @@ which looks like it is working.
 image is written to disk instead and the error is logged - the artisan keeps her
 photograph rather than losing it to a bucket policy.
 
+### Move the photographs that already exist
+
+Setting those five variables only changes where the *next* photograph goes. Every
+image taken before that is a file under `backend/media/`, and every listing holds a
+URL pointing at whichever hostname was serving it at the time. Move them:
+
+```bash
+cd backend
+python migrate_media_to_s3.py --dry-run     # what would move, and where to
+python migrate_media_to_s3.py               # upload, then rewrite the stored URLs
+```
+
+It uploads each file under its own name, then rewrites `image_url`, `raw_url` and the
+thumbnail inside `vision` on every listing to point at the bucket. Safe to run twice.
+
+Skip it and the storefront shows a dead photograph. The Provenance Passport page is
+worse than dead: its whole claim is "here is the photograph as taken, and here is the
+one buyers see", and two broken images leave that claim standing while making it
+impossible to check.
+
 ## 3. A public HTTPS host
 
 ```bash
@@ -270,6 +290,66 @@ it has not been made.
 
 So the honest position is: **`plan: starter`, roughly $7/month.** That is the smallest
 instance this runs on as the code stands.
+
+### The free host that does have the memory: Hugging Face Spaces
+
+A Docker Space on the free CPU tier gets **2 vCPU and 16 GB of RAM**, which is far
+more than the 700 MB above, and a permanent hostname of the form
+`https://<user>-<space>.hf.space`. That hostname is what makes it worth the slight
+oddness of running an API on a machine-learning demo host: the Provenance Passport QR
+code printed on a finished product encodes `PUBLIC_BASE_URL`, so a disposable tunnel
+hostname means a QR that stops resolving the week after it is printed.
+
+It sleeps after a long idle period and wakes on the first request, which costs a cold
+start and nothing else. Nothing in the container is persistent, which is exactly why
+Postgres and the image bucket are the two sections above this one.
+
+1. **huggingface.co**, then **New Space**. Choose **Docker** as the SDK and *blank*
+   as the template. Free CPU basic. Make it **public** - a private Space needs a
+   token on every request, and the storefront and passport pages are meant to be
+   opened by a buyer with no account.
+2. The repository already carries what a Space needs: `Dockerfile` at the root, and
+   the YAML front matter at the top of `README.md` that names `sdk: docker` and
+   `app_port: 7860`. Do not delete either; the Space reads them on every build.
+3. Push this repository to the Space:
+
+   ```bash
+   git remote add space https://huggingface.co/spaces/<user>/<space>
+   git push space main
+   ```
+
+   Hugging Face asks for a username and an **access token** as the password. Create
+   one under Settings → Access Tokens with **write** permission.
+4. **Settings → Variables and secrets** on the Space, and add every value from
+   `backend/.env` as a **secret** - `DATABASE_URL`, `NVIDIA_API_KEY`, `JWT_SECRET`,
+   `VIEW_SALT`, the `MEDIA_S3_*` group, the Razorpay keys, the SMS keys. Secrets are
+   injected as environment variables at runtime and are not readable from the repo,
+   which matters because the Space is public.
+5. Set `PUBLIC_BASE_URL` to the Space's own address,
+   `https://<user>-<space>.hf.space`, with no trailing slash. This is the one
+   variable that cannot be filled in before the Space exists, and the one that every
+   storefront link, passport QR code and webhook target is built from.
+6. Watch the build log on the Space page. The first build takes several minutes,
+   mostly `pip install` and the 176 MB U²-Net download. When it finishes, check it
+   the way anything else is checked here:
+
+   ```bash
+   curl https://<user>-<space>.hf.space/health
+   cd backend && PUBLIC_BASE_URL=https://<user>-<space>.hf.space python preflight.py --production
+   ```
+
+7. In the app, set the same URL as the backend address in Settings, rebuild the APK,
+   and the QR codes it draws from then on point at a hostname that will still be
+   there next month.
+
+**One thing to know about the filesystem.** The container writes
+`passport_key.pem` - the Ed25519 key that signs Provenance Passports - on first use,
+and that file does not survive a rebuild. A new key is generated and passports minted
+after the rebuild are signed with it. Older passports still verify: each one stores
+the public key that actually signed it, so `/passport/{id}` checks against that rather
+than against whatever key the server holds today. Nothing breaks; it is simply worth
+knowing that "the Kalakriti key" is not one key over time. Mounting persistent storage
+for that one file is the fix when it starts to matter.
 
 ## 4. Real SMS, so login works for somebody who is not you
 
@@ -310,7 +390,14 @@ received, which is the truth.
 [ ] OTP_DEV_ECHO          NOT SET
 [ ] instance memory       2 GB; there is no low-memory mode
 [ ] EXPO_PUBLIC_API_URL   the https:// host, baked into the APK
+[ ] old images moved      python migrate_media_to_s3.py
+[ ] passport QR scanned   from a real phone's camera app, after the host is final
 ```
+
+The last line is the one that is easy to skip. The Provenance Passport QR code encodes
+`PUBLIC_BASE_URL` at the moment the photograph is analysed, so every passport minted
+against a temporary hostname points at a hostname that will stop existing. Settle the
+host first, then mint the passports you intend to print.
 
 Then, rather than reading that list back to yourself:
 

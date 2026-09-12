@@ -77,11 +77,14 @@ export function Btn({
 /* -------------------------------------------------------------------- Card */
 
 export function Card({
-  children, style, tone = 'plain', onPress,
+  children, style, tone = 'plain', onPress, onLongPress,
 }: {
   children: React.ReactNode; style?: ViewStyle;
   tone?: 'plain' | 'soft' | 'indigo' | 'money' | 'warn' | 'danger';
   onPress?: () => void;
+  /** Held down rather than tapped. Used for destructive actions, which should not
+   *  sit under a thumb that is only trying to open something. */
+  onLongPress?: () => void;
 }) {
   const map = {
     plain:  { bg: C.surface,     bd: C.line },
@@ -97,7 +100,10 @@ export function Card({
       {children}
     </View>
   );
-  return onPress ? <Pressable onPress={onPress}>{body}</Pressable> : body;
+  return onPress || onLongPress
+    ? <Pressable onPress={onPress} onLongPress={onLongPress}
+                 delayLongPress={450}>{body}</Pressable>
+    : body;
 }
 
 /* ------------------------------------------------------------------ Screen */
@@ -265,6 +271,7 @@ import { TextInput } from 'react-native';
  */
 export function Field({
   label, value, onChange, placeholder, multiline, numeric, confidence, source, suffix,
+  secure,
 }: {
   label: string;
   value: string;
@@ -272,6 +279,9 @@ export function Field({
   placeholder?: string;
   multiline?: boolean;
   numeric?: boolean;
+  /** Masks the text and turns off autocorrect - for passwords, not for secrets
+   *  that need to be read back, since this user may not type accurately. */
+  secure?: boolean;
   confidence?: number;
   source?: string;
   suffix?: string;
@@ -305,6 +315,9 @@ export function Field({
           placeholder={placeholder}
           placeholderTextColor={C.inkSoft}
           multiline={multiline}
+          secureTextEntry={secure}
+          autoCapitalize={secure ? 'none' : 'sentences'}
+          autoCorrect={!secure}
           keyboardType={numeric ? 'numeric' : 'default'}
           style={{
             flex: 1, paddingVertical: 14, fontSize: 17, color: C.ink,

@@ -50,7 +50,7 @@ const SORTS: SortDef<api.Card>[] = [
 ];
 
 export default function ProductsTab({
-  cards, loading, offline, lastSync, onOpen, onLanguage, onRefresh,
+  cards, loading, offline, lastSync, onOpen, onLanguage, onRefresh, onDelete,
 }: {
   cards: api.Card[];
   loading: boolean;
@@ -59,6 +59,8 @@ export default function ProductsTab({
   onOpen: (id: string) => void;
   onLanguage: () => void;
   onRefresh: () => void;
+  /** Discard a draft. Only offered for drafts - see the guard on the card below. */
+  onDelete?: (id: string, title: string) => void;
 }) {
   const { t } = useI18n();
   const [filter, setFilter] = useState('all');
@@ -95,8 +97,21 @@ export default function ProductsTab({
             <Text style={[T.bodySoft, { textAlign: 'center' }]}>{t('prod.emptySub')}</Text>
           ) : null}
         </Card>
-      ) : shown.map((c) => (
-        <Card key={c.id} onPress={() => onOpen(c.id)}>
+      ) : (
+        <>
+        {/* Holding a card down is invisible unless somebody says so, and an artisan
+            who wants a draft gone will otherwise hunt for a button that is not
+            there. Only shown when there is actually a draft to delete. */}
+        {onDelete && shown.some((c) => c.status === 'draft') ? (
+          <Text style={[T.micro, { fontSize: 12, color: C.inkSoft }]}>
+            {t('prod.deleteHint')}
+          </Text>
+        ) : null}
+        {shown.map((c) => (
+        <Card key={c.id} onPress={() => onOpen(c.id)}
+              onLongPress={c.status === 'draft' && onDelete
+                ? () => onDelete(c.id, c.title || '')
+                : undefined}>
           <View style={{ flexDirection: 'row', gap: S.md }}>
             {c.imageUrl ? (
               <Image source={{ uri: c.imageUrl }}
@@ -156,7 +171,9 @@ export default function ProductsTab({
             </View>
           ) : null}
         </Card>
-      ))}
+        ))}
+        </>
+      )}
     </TabScreen>
   );
 }

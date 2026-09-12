@@ -22,6 +22,13 @@ import argparse
 import os
 import sys
 
+from dotenv import load_dotenv
+
+# Every other entry point reads .env before touching db, and this one did not - so
+# `DATABASE_URL` set in the file was invisible here and the script reported "no
+# destination" while the application connected to Supabase perfectly well.
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+
 from sqlalchemy import create_engine, func, insert, inspect, select, text
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -43,6 +50,19 @@ TABLE_ORDER: list = [
     db.ListingView,
     db.Shipment,
     db.Event,
+
+    # The cooperative model. Clusters are owned by an artisan, memberships reference
+    # both, and a goods receipt references a cluster plus the order or enquiry it was
+    # produced against - so every one of these has to follow the tables above. A
+    # settlement line cannot precede its settlement, and a review cannot precede the
+    # settlement that proves the reviewer earned the right to leave it.
+    db.HsnGstRate,
+    db.Cluster,
+    db.ClusterMembership,
+    db.GoodsReceipt,
+    db.Settlement,
+    db.SettlementLine,
+    db.Review,
 ]
 
 try:

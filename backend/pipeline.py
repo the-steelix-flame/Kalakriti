@@ -22,6 +22,7 @@ from typing import Any, Callable
 import bg
 import db
 import imaging
+import passport
 import vision
 
 Stage = Callable[[str, int], None]
@@ -58,14 +59,22 @@ def analyse_into(s, listing, data: bytes, *, transcript: str = "",
         thumb_url = save_media(thumb, listing.id, "thumb")
         listing.raw_hash = "sha256:" + hashlib.sha256(data).hexdigest()
         listing.image_url = url
+        # Manual mode runs no operation on the photograph, so the stored image is
+        # the photograph. The passport page shows the same file on both sides, which
+        # is the honest thing for it to show.
+        listing.raw_url = url
         listing.enhance_ops = ["manual: stored as taken, no models run"]
         listing.vision = {"thumbUrl": thumb_url, "notes": "manual mode: not analysed"}
         listing.transcript = transcript or listing.transcript
         listing.status = "draft"
         db.log_event(s, "listing", listing.id, "status", "processing", "draft",
                      "photo stored; manual mode, no models run")
+        # Manual mode earns a passport too, and its operation log is the strongest
+        # one there is: nothing was done to this photograph.
+        pp = passport.for_listing(s, listing)
         on_stage("done", 100)
         return {"listingId": listing.id, "imageUrl": url, "thumbUrl": thumb_url,
+                "rawUrl": listing.raw_url, "passport": pp,
                 "rawHash": listing.raw_hash, "ops": listing.enhance_ops, "ms": 0,
                 "ocr": {"ok": False, "boxes": [], "text": ""}, "detected": {},
                 "suggestions": {}, "confidence": {},
@@ -110,6 +119,16 @@ def analyse_into(s, listing, data: bytes, *, transcript: str = "",
     if cut is not None:
         save_media(cut, lid, "cut")
 
+    # Keep the photograph as it came off the camera. The Provenance Passport claims
+    # the enhanced image derives from this one by exactly the listed operations, and
+    # a buyer cannot check that claim against a file nobody kept. Storing it costs
+    # one more upload and is the difference between a passport and an assertion.
+    raw_url = ""
+    try:
+        raw_url = save_media(imaging.Image.open(io.BytesIO(data)), lid, "raw")
+    except Exception:
+        raw_url = ""      # a missing original must not lose the listing
+
     # A small copy, so an app on a slow connection can show something for 15 KB
     # instead of 200. Only worth making when the pipeline already has the image open.
     thumb_url = ""
@@ -123,6 +142,7 @@ def analyse_into(s, listing, data: bytes, *, transcript: str = "",
     f = mapped["fields"]
     listing.raw_hash = raw_hash
     listing.image_url = image_url
+    listing.raw_url = raw_url
     listing.enhance_ops = ops
     listing.vision = {"confidence": mapped["confidence"],
                       "suggestions": mapped["suggestions"],
@@ -147,10 +167,17 @@ def analyse_into(s, listing, data: bytes, *, transcript: str = "",
     db.log_event(s, "listing", lid, "status", "processing", "draft",
                  "analysis complete")
 
+    # Sign what was done, now, while the operation list is in hand and complete.
+    # Minting here rather than from the app is what gives the background-job path a
+    # passport at all - that path has no client waiting to ask for one.
+    pp = passport.for_listing(s, listing)
+
     on_stage("done", 100)
     return {
         "listingId": lid,
+        "passport": pp,
         "imageUrl": image_url,
+        "rawUrl": raw_url,
         "thumbUrl": thumb_url,
         "rawHash": raw_hash,
         "ops": ops,

@@ -36,3 +36,6 @@ Thumbs.db
 .idea/
 .vscode/
 
+# Rows removed by dedupe_listings.py, kept so a deletion is reversible. Real
+# listing data from whoever ran it, and of no use to anybody else.
+backend/dedupe-backups/

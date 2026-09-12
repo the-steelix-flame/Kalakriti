@@ -224,7 +224,7 @@ def analyse(data: bytes, ocr: dict[str, Any] | None = None,
 
     # ---- stage A: perception. VLM, prose only. -------------------------------
     try:
-        r = llm.client().chat.completions.create(
+        r = llm.vision_client().chat.completions.create(
             model=VLM_MODEL,
             messages=[{"role": "user", "content": [
                 {"type": "text", "text": LOOK_PROMPT},
@@ -236,7 +236,16 @@ def analyse(data: bytes, ocr: dict[str, Any] | None = None,
         )
         seen = (r.choices[0].message.content or "").strip()
     except Exception as e:
-        return {"ok": False, "error": f"VLM {type(e).__name__}: {e}", "fields": {}}
+        # Say which of the two it was, because the answer is different. A timeout means
+        # the endpoint is queueing and the listing goes ahead without detection, which
+        # the caller already handles. Anything else is a real fault worth reading.
+        if type(e).__name__ in ("APITimeoutError", "APIConnectionError"):
+            msg = (f"the vision model did not answer within {llm.VLM_TIMEOUT:.0f}s. "
+                   f"The photograph is kept and the listing goes on without automatic "
+                   f"detection; tap re-analyse to try it again.")
+        else:
+            msg = f"VLM {type(e).__name__}: {e}"
+        return {"ok": False, "error": msg, "fields": {}}
 
     if not seen:
         return {"ok": False, "error": "VLM returned nothing", "fields": {}}

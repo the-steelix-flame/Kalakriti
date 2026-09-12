@@ -46,11 +46,36 @@ def available() -> bool:
     return bool(API_KEY)
 
 
+# How long to wait on the endpoint, and how many times to try.
+#
+# This was `timeout=600` with the client's default of two retries, which is up to
+# thirty minutes on one call. That is the reason a congested endpoint looked like a
+# dead app rather than a slow one: nothing below ever got to run its own error path,
+# and /v1/analyze already handles a refused vision call perfectly well.
+#
+# A retry against an endpoint that is slow because it is queueing does not help - it
+# joins the same queue again, having already spent the timeout. So retries are for
+# genuine errors (a 503 handed back immediately), not for a wait.
+LLM_TIMEOUT = float(os.getenv("LLM_TIMEOUT") or "120")
+LLM_RETRIES = int(os.getenv("LLM_RETRIES") or "1")
+
+# The vision stage is a separate budget because it behaves differently: measured at
+# 99, 120, 149 and 169 seconds on one image, against 8 to 19 for the text model. It
+# gets longer to answer and no retry, so the worst case is one wait rather than three.
+VLM_TIMEOUT = float(os.getenv("VLM_TIMEOUT") or "180")
+
+
 def client() -> OpenAI:
     global _client
     if _client is None:
-        _client = OpenAI(base_url=BASE_URL, api_key=API_KEY, timeout=600)
+        _client = OpenAI(base_url=BASE_URL, api_key=API_KEY,
+                         timeout=LLM_TIMEOUT, max_retries=LLM_RETRIES)
     return _client
+
+
+def vision_client() -> OpenAI:
+    """The same endpoint on the vision budget: longer wait, no retry."""
+    return client().with_options(timeout=VLM_TIMEOUT, max_retries=0)
 
 
 def _strip_reasoning(text: str) -> str:

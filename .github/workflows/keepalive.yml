@@ -1,0 +1,114 @@
+# Keep the Hugging Face Space awake, and notice when it is not.
+#
+# A free Docker Space on Hugging Face sleeps after 48 hours with no traffic. Waking
+# it is not instant: the container comes back from the image and the first request
+# waits 30 to 60 seconds while uvicorn starts and the ONNX sessions load. That is the
+# difference between a demo that opens and a demo that spins.
+#
+# Why every 30 minutes and not every 5
+# ------------------------------------
+# The threshold is 48 hours, so half-hourly is already 96 times more often than it
+# needs to be. Tighter buys nothing and costs real Actions minutes: a 5-minute cron
+# is 8,640 runs a month, which on a private repository eats most of the free
+# 2,000-minute budget for no benefit. Public repositories get unlimited minutes, so
+# on a public repo the interval is free either way - it stays at 30 minutes, because
+# a schedule should be as slow as the thing it protects allows.
+#
+# What this does NOT do
+# ---------------------
+# It does not stop a Space restarting on its own, and it cannot make a cold start
+# fast. It stops the *idle* sleep, which is the predictable one.
+#
+# Two things worth knowing before trusting it:
+#
+#   - GitHub disables scheduled workflows on a repository with no pushes for 60 days,
+#     and emails the owner. If the pings stop, check that first.
+#   - Cron on shared runners is best-effort and can drift by ten or twenty minutes
+#     under load. Harmless here, but worth knowing before debugging a gap.
+#
+# Setting the URL
+# ---------------
+# Settings -> Secrets and variables -> Actions -> Variables -> New repository
+# variable, named BACKEND_URL, holding the Space address with no trailing slash:
+#
+#     https://<user>-<space>.hf.space
+#
+# A variable rather than a secret, on purpose. The address is public - buyers open
+# storefront links on it - so hiding it would buy nothing and would stop the log
+# saying which host failed.
+
+name: Keep the backend awake
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  # So it can be run by hand straight after a deploy, without waiting for the cron.
+  workflow_dispatch:
+
+# A slow wake-up must never overlap the next scheduled run.
+concurrency:
+  group: keepalive
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - name: Ping /health until it answers
+        env:
+          BACKEND_URL: ${{ vars.BACKEND_URL }}
+        run: |
+          set -uo pipefail
+
+          if [ -z "${BACKEND_URL:-}" ]; then
+            echo "::error::BACKEND_URL is not set."
+            echo "Set it under Settings -> Secrets and variables -> Actions ->"
+            echo "Variables, as the Space address with no trailing slash, e.g."
+            echo "  https://your-user-kalakriti.hf.space"
+            exit 1
+          fi
+
+          URL="${BACKEND_URL%/}/health"
+          echo "pinging $URL"
+
+          # Six attempts over roughly three minutes. A sleeping Space answers 503 and
+          # then takes most of a minute to come up, so a single request would report a
+          # perfectly healthy backend as dead every time it had gone to sleep - which
+          # is exactly the case this workflow exists for.
+          for attempt in 1 2 3 4 5 6; do
+            # `|| echo 000` would append to whatever curl already printed, and curl
+            # prints 000 of its own when it cannot connect - so a DNS failure read
+            # back as "HTTP 000000". Take curl's exit status separately instead.
+            code=$(curl -sS -o /tmp/health.json -w '%{http_code}' \
+                        --max-time 45 "$URL") || code="000"
+            [ -n "$code" ] || code="000"
+
+            if [ "$code" = "200" ]; then
+              echo "awake (HTTP 200) on attempt $attempt"
+
+              # Surface a little of what it said, so a Space that is up but
+              # misconfigured - no database, no model key - is visible here rather
+              # than only later in the app. grep rather than a parser: this runs on a
+              # bare runner and a missing field should not fail the ping.
+              echo "--- /health ---"
+              grep -o '"engine":"[^"]*"'  /tmp/health.json || true
+              grep -o '"llm":"[^"]*"'     /tmp/health.json || true
+              grep -o '"ok":[a-z]*'       /tmp/health.json | head -1 || true
+              exit 0
+            fi
+
+            echo "attempt $attempt: HTTP $code"
+            if [ "$attempt" -lt 6 ]; then sleep 30; fi
+          done
+
+          # Failing loudly is the point. A silent keep-alive that has been pinging a
+          # dead host for a week is worse than none, because it is believed.
+          echo "::error::$URL did not answer after 6 attempts over ~3 minutes."
+          echo "Check the Space's build log. The usual causes are a crashed build, a"
+          echo "missing secret (DATABASE_URL, NVIDIA_API_KEY), or the Space having"
+          echo "been paused in its Settings."
+          exit 1

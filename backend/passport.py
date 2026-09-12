@@ -49,15 +49,47 @@ PUBLIC_BASE = os.getenv("PUBLIC_BASE_URL", "http://localhost:8000")
 
 
 def signing_key():
-    """The Ed25519 private key, generated once and kept on disk.
+    """The Ed25519 private key. From the environment if given, otherwise from disk.
 
-    On a host with an ephemeral filesystem this file is regenerated after a redeploy,
-    which would leave older passports signed by a key nobody publishes any more. That
-    is why the public key is stored per passport rather than looked up globally: an
-    old passport still verifies against the key that actually signed it.
+    Three cases, in order:
+
+    1. `PASSPORT_PRIVATE_KEY` - 32 base64-encoded bytes. This is the one to use on a
+       hosted container, where the filesystem is wiped on every redeploy. Generate it
+       once with:
+
+           python -c "import base64;from cryptography.hazmat.primitives.asymmetric \\
+             import ed25519;print(base64.b64encode(
+             ed25519.Ed25519PrivateKey.generate().private_bytes_raw()).decode())"
+
+    2. A PEM file at `PASSPORT_KEY_PATH`, which is how a laptop keeps one key across
+       restarts without anybody configuring anything.
+
+    3. Neither, so generate and write one.
+
+    Case 3 on an ephemeral host means a new issuer key after every redeploy. That is
+    survivable rather than fatal, because each passport stores the public key that
+    actually signed it, so an old passport still verifies. What it costs is a stable
+    issuer identity - a verifier cannot say "this is Kalakriti's key" when the key
+    changes weekly - which is the reason case 1 exists.
     """
+    import base64
+
     from cryptography.hazmat.primitives import serialization
     from cryptography.hazmat.primitives.asymmetric import ed25519
+
+    raw = (os.getenv("PASSPORT_PRIVATE_KEY") or "").strip()
+    if raw:
+        try:
+            material = base64.b64decode(raw)
+            # Accept a 64-byte seed+public concatenation too, since that is the shape
+            # ONDC_SIGNING_PRIVATE_KEY uses and confusing the two is an easy mistake.
+            return ed25519.Ed25519PrivateKey.from_private_bytes(material[:32])
+        except Exception as exc:
+            raise RuntimeError(
+                "PASSPORT_PRIVATE_KEY is set but is not 32 base64-encoded bytes. "
+                "Leave it empty to fall back to a key file, or regenerate it - do "
+                "not let it silently sign with a different key."
+            ) from exc
 
     if os.path.exists(KEY_PATH):
         with open(KEY_PATH, "rb") as f:

@@ -69,6 +69,10 @@ app/
 Windows, side by side, including which two accounts to sign in with and why OTP does
 not work yet. Read that before `SETUP.md`, which is the longer reference.
 
+To get the backend off a laptop and onto a permanent address,  is
+the step-by-step for Hugging Face Spaces. After that nobody needs a tunnel, one APK
+works for the whole team, and the address never changes again.
+
 Two things that catch everybody:
 
 - `backend/.env` is not in the repo. Ask in the group for it.

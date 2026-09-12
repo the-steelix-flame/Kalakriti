@@ -236,16 +236,35 @@ They existed only because the backend was on a laptop:
 EXPO_PUBLIC_API_URL=https://kalakriti-api.onrender.com
 ```
 
-With no plain-HTTP host left in the list, `plugins/withLocalNetworkAccess` can also
-come out of `app/app.json`. The app then refuses cleartext to anything, anywhere, which
-is the posture it should ship in.
+**Leave `plugins/withLocalNetworkAccess` in `app/app.json`.** An earlier version of this
+guide said it could come out now that no plain-HTTP host is left in `.env`, and that was
+wrong. `lib/config.ts` still appends `http://<metro-host>:8000` as a candidate whenever
+a Metro host is present, and a teammate who builds a release APK against their own
+laptop on the LAN needs cleartext to a private address to be permitted. Removing the
+plugin would break that with `CLEARTEXT communication not permitted`, which is a
+confusing error for a real workflow. The plugin permits cleartext on loopback and the
+three private ranges only; a public host still requires HTTPS, so it costs nothing.
 
-Rebuild and install:
+**Delete the two cached bundles before rebuilding.** This is the step that bites: a
+change to `app/.env` does not invalidate Gradle's bundle task, so `assembleRelease`
+happily reuses a bundle with the old URL baked in and produces an APK that points at a
+host which no longer exists. Nothing warns you.
 
 ```bash
 cd app/android
+rm -f app/build/generated/assets/react/release/index.android.bundle       app/build/intermediates/assets/release/mergeReleaseAssets/index.android.bundle
 ./gradlew assembleRelease -PreactNativeArchitectures=arm64-v8a
 adb install -r app/build/outputs/apk/release/app-release.apk
+```
+
+Both `JAVA_HOME` and `ANDROID_HOME` have to be set on that `gradlew` line or it stops
+before compiling anything. `RUNNING.md` section 6 has the per-platform form and how to
+find your JDK path.
+
+To prove the URL actually made it in, before installing:
+
+```bash
+grep -c onrender.com app/build/generated/assets/react/release/index.android.bundle
 ```
 
 **This is the last time the URL forces a rebuild.** From here the address is permanent,

@@ -16,7 +16,27 @@ from typing import Any
 from openai import OpenAI
 
 BASE_URL = os.getenv("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1")
-MODEL = os.getenv("NEMOTRON_MODEL", "nvidia/nemotron-3-ultra-550b-a55b")
+# Which Nemotron writes the listing copy.
+#
+# Was nemotron-3-ultra-550b-a55b, and the report that prompted this change was that
+# the app "used to work faster". It did. The model got slower, not the app.
+#
+# Measured from a laptop, so none of this is the hosting: three listings through
+# chat_json at the production token limit.
+#
+#     nemotron-3-ultra-550b-a55b    mean 58.2s   (29.3 - 104.3)   3/3 usable
+#     nemotron-3-super-120b-a12b    mean 12.2s   ( 8.5 -  19.4)   3/3 usable
+#
+# The ultra endpoint also returned 503 "Service temporarily overloaded" outright, and
+# the OpenAI client retries that silently, which is where a 91-second request against
+# the deployed backend actually went. It was queueing, not computing.
+#
+# Same family, so the prompts carry over unchanged. The one difference worth knowing:
+# on a terracotta diya, super guessed HSN 4421, a wood code, where ultra guessed 6909.
+# Both are wrong in different ways for that item and the field is editable, so this
+# buys a five-fold speed-up for no reliability the tests could detect. Set
+# NEMOTRON_MODEL to go back.
+MODEL = os.getenv("NEMOTRON_MODEL", "nvidia/nemotron-3-super-120b-a12b")
 API_KEY = os.getenv("NVIDIA_API_KEY", "")
 
 _client: OpenAI | None = None

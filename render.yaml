@@ -55,8 +55,6 @@ services:
     # matting-model download at build time, which is pure waste when the process will
     # refuse to load it. Keep it in step with the LOCAL_VISION env var below - the ARG
     # decides what is baked in, the env var decides what runs.
-    dockerBuildArgs:
-      LOCAL_VISION: "off"
 
     envVars:
       # See the plan note at the top of this file. This is the setting that makes a

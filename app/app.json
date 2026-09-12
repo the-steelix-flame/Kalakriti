@@ -14,7 +14,7 @@
     "android": {
       "package": "in.kalakriti.app",
       "adaptiveIcon": {
-        "backgroundColor": "#B4531F",
+        "backgroundColor": "#FCF5E3",
         "foregroundImage": "./assets/android-icon-foreground.png",
         "backgroundImage": "./assets/android-icon-background.png",
         "monochromeImage": "./assets/android-icon-monochrome.png"

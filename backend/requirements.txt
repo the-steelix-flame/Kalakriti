@@ -17,3 +17,4 @@ requests==2.32.3             # Apache-2.0 - marketplace + payment HTTP
 # import time: the app falls back to SQLite and local disk if they are absent.
 psycopg[binary]==3.2.3       # LGPL-3.0 - Postgres driver, for DATABASE_URL
 boto3==1.35.90               # Apache-2.0 - S3-compatible object storage (R2, Supabase)
+PyJWT==2.10.1

@@ -698,6 +698,83 @@ def check_logistics() -> None:
 
 # --------------------------------------------------- 6b. demo accounts
 
+def check_requirements_in_step() -> None:
+    """
+    Do the Space and this laptop install the same packages?
+
+    There are two requirements files. `backend/requirements.txt` is the source of
+    truth and what a developer installs; `requirements.txt` at the repository root is
+    what a Hugging Face Space installs. It has to be a copy rather than an include,
+    because a Space bind-mounts that one file at /tmp and `-r backend/...` resolves to
+    a path that was never mounted.
+
+    A copy nobody verifies is wrong within a fortnight, and this particular copy is
+    worth checking because the failure only shows up in production: the Space quietly
+    installs a different version from every laptop, and the bug that follows is
+    unreproducible by the person asked to fix it.
+
+    Only the shared pins are compared. The root file also lists `gradio`, which the
+    application never imports and the backend must not depend on.
+    """
+    title = "9. Requirements files in step"
+    here = os.path.dirname(os.path.abspath(__file__))
+    backend_req = os.path.join(here, "requirements.txt")
+    root_req = os.path.join(os.path.dirname(here), "requirements.txt")
+
+    if not os.path.exists(root_req):
+        report(WARN, title,
+               "There is no requirements.txt at the repository root, so a Hugging "
+               "Face Space has nothing to install. Only a problem if you deploy.")
+        return
+
+    def pins(path: str) -> dict[str, str]:
+        out: dict[str, str] = {}
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.split("#", 1)[0].strip()
+                if not line or line.startswith("-"):
+                    continue
+                if "==" in line:
+                    name, version = line.split("==", 1)
+                    out[name.strip().lower()] = version.strip()
+                else:
+                    out[line.strip().lower()] = ""
+        return out
+
+    try:
+        mine, theirs = pins(backend_req), pins(root_req)
+    except Exception as e:                                  # noqa: BLE001
+        report(WARN, title, f"Could not compare: {type(e).__name__}: {e}")
+        return
+
+    # gradio belongs only to the Space. Everything else should match exactly.
+    theirs.pop("gradio", None)
+
+    missing = sorted(set(mine) - set(theirs))
+    differing = sorted(n for n in set(mine) & set(theirs) if mine[n] != theirs[n])
+    extra = sorted(set(theirs) - set(mine))
+
+    if not (missing or differing or extra):
+        report(PASS, title,
+               f"Both requirements files pin the same {len(mine)} packages, so the "
+               f"Space installs what a laptop installs.")
+        return
+
+    lines = []
+    for n in missing:
+        lines.append(f"  {n} is in backend/requirements.txt and not at the root")
+    for n in differing:
+        lines.append(f"  {n}: backend pins {mine[n]}, the root pins {theirs[n]}")
+    for n in extra:
+        lines.append(f"  {n} is at the root and not in backend/requirements.txt")
+
+    report(FAIL if STRICT else WARN, title,
+           "The two requirements files have drifted, so a deployed Space will not "
+           "install what you are running here:\n" + "\n".join(lines),
+           "Copy backend/requirements.txt into the root file, keeping the gradio "
+           "line at the bottom")
+
+
 def check_demo_accounts() -> None:
     """
     Are the seeded demo accounts still present with their seeded passwords?
@@ -775,7 +852,7 @@ def main() -> int:
 
     for check in (check_llm, check_database, check_storage, check_public_base_url,
                   check_secrets, check_otp, check_demo_accounts, check_channels,
-                  check_logistics):
+                  check_logistics, check_requirements_in_step):
         try:
             check()
         except Exception as e:                          # noqa: BLE001

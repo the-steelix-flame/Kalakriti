@@ -1,17 +1,49 @@
-# Dependencies for a non-Docker Hugging Face Space.
+# Dependencies for the Hugging Face Space.
 #
-# A Space installs the requirements.txt at the repository root, and the real list
-# lives in backend/. Rather than keep two copies that drift, this includes that one -
-# pip resolves `-r` relative to this file, so there is still exactly one place where
-# a version is pinned.
+# ─────────────────────────────────────────────────────────────────────────────
+#  KEEP IN STEP WITH backend/requirements.txt, WHICH IS THE SOURCE OF TRUTH.
+#  `python backend/preflight.py` fails if these two drift apart.
+# ─────────────────────────────────────────────────────────────────────────────
 #
-# The apt packages opencv needs (libgl1, libglib2.0-0) are in packages.txt beside
-# this, which is the non-Docker equivalent of the Dockerfile's apt-get line.
--r backend/requirements.txt
+# Why this is a copy and not an include
+# -------------------------------------
+# This file started as one line - `-r backend/requirements.txt` - which is the right
+# way to avoid two lists, and it does not work here. A Space does not copy the
+# repository before installing; it bind-mounts this single file at
+# /tmp/requirements.txt and runs pip against it. `-r` resolves relative to the file,
+# so pip went looking for /tmp/backend/requirements.txt, which was never mounted:
+#
+#   ERROR: Could not open requirements file:
+#   [Errno 2] No such file or directory: '/tmp/backend/requirements.txt'
+#
+# So the list is inlined. The preflight check exists because a copy nobody verifies
+# is a copy that is wrong within a fortnight - and the failure mode is nasty: the
+# Space installs a different version from every laptop, and the bug only appears in
+# production.
 
-# Only the Space needs this. The `gradio` SDK is how a Space runs a plain Python
-# process: it installs these requirements, installs packages.txt, and then runs
-# app.py, which starts uvicorn on port 7860. Nothing in this project imports gradio
-# and no Gradio interface is served - it is the platform's launcher, not a dependency
-# of the application, which is why it is pinned here and not in backend/.
+fastapi==0.115.6           # MIT
+uvicorn[standard]==0.34.0  # BSD
+pydantic==2.10.4           # MIT
+python-dotenv==1.0.1       # BSD
+openai==1.59.6             # MIT - client only; points at NVIDIA's OpenAI-compatible endpoint
+pillow==11.1.0             # HPND
+cryptography==44.0.0       # Apache-2.0 - Ed25519 passport signing
+rembg==2.0.61              # MIT - U^2-Net background matting
+onnxruntime==1.20.1        # MIT - CPU inference for rembg
+rapidocr-onnxruntime==1.4.4  # Apache-2.0 - local OCR (detection + recognition)
+sqlalchemy==2.0.36           # MIT - listings, publications, orders, event log
+requests==2.32.3             # Apache-2.0 - marketplace + payment HTTP
+
+# ── hosting ────────────────────────────────────────────────────────────────
+psycopg[binary]==3.2.3       # LGPL-3.0 - Postgres driver, for DATABASE_URL
+boto3==1.35.90               # Apache-2.0 - S3-compatible object storage (R2, Supabase)
+
+# Nothing above is Space-specific. Nothing below is used by the application.
+#
+# The Gradio SDK is how a Space runs a plain Python process: it installs this file,
+# installs packages.txt, then runs app.py, which starts uvicorn. No Gradio interface
+# is served and no module here imports gradio. The Space's own build layer installs
+# gradio, torch and uvicorn regardless of what this file says, so pinning gradio here
+# only keeps it from resolving to something newer than the `sdk_version` in the
+# README front matter.
 gradio==5.9.1

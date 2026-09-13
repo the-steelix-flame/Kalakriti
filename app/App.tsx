@@ -384,10 +384,6 @@ function AppInner() {
                       onPayouts={() => setTab('reports')}
                       onRevenue={() => setTab('reports')}
                       onBulkSplitting={() => setStack({ screen: 'enquiries' })}
-                      // The roster lives inside a cluster, because capacity belongs to
-                      // the cluster that is promising it. With one cluster we go
-                      // straight in; with several the list comes first.
-                      onRoster={() => setStack({ screen: 'clusters' })}
                       onClusters={() => setStack({ screen: 'clusters' })}
                     />
                   ) : null}

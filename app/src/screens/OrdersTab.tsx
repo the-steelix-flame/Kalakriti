@@ -10,7 +10,7 @@
  * always fails, which teaches the artisan the app is unreliable.
  */
 import React, { useMemo, useState } from 'react';
-import { View, Text, Pressable, Linking, RefreshControl } from 'react-native';
+import { View, Text, Pressable, Linking, RefreshControl, Alert } from 'react-native';
 import { Card, Btn, Pill, Row, StatusChip, Skeleton, Divider, money } from '../ui';
 import { FilterBar, applyList, byDate, byNum, FilterDef, SortDef } from '../ui/Filters';
 import { C, S, T, R } from '../theme';
@@ -19,23 +19,25 @@ import { TabScreen } from '../nav/Shell';
 import { useI18n } from '../i18n';
 import { ago } from '../lib/ago';
 import * as api from '../lib/api';
+import { recordAndUploadPackagingVideo } from '../lib/packagingVideo';
+import { isPending, isPreparing, isInTransit, isDelivered, isCancelled, isReturned }
+  from '../lib/orderStages';
 
+// Bucketed through lib/orderStages.ts rather than a bare list of strings, so this
+// chip means the same thing here and in Reports regardless of whether the order was
+// last touched by checkout's original created/paid/shipped vocabulary or by the
+// transit tracker's finer-grained one.
 const FILTERS: FilterDef<api.Order>[] = [
   { key: 'all', label: 'prod.all', match: () => true },
-  { key: 'pending', label: 'ord.filterPending',
-    match: (o) => ['created', 'payment_pending'].includes(o.status) },
+  { key: 'pending', label: 'ord.filterPending', match: (o) => isPending(o.status) },
   { key: 'paid', label: 'ord.filterPaid',
     match: (o) => o.status === 'paid' || (o.paymentStatus === 'paid'
                     && o.status === 'confirmed') },
-  { key: 'processing', label: 'ord.filterProcessing',
-    match: (o) => ['confirmed', 'packed'].includes(o.status) },
-  { key: 'shipped', label: 'ord.filterShipped',
-    match: (o) => ['shipped', 'out_for_delivery'].includes(o.status) },
-  { key: 'delivered', label: 'ord.filterDelivered',
-    match: (o) => ['delivered', 'completed'].includes(o.status) },
-  { key: 'cancelled', label: 'ord.filterCancelled',
-    match: (o) => ['cancelled', 'failed'].includes(o.status) },
-  { key: 'returned', label: 'ord.filterReturned', match: (o) => o.status === 'refunded' },
+  { key: 'processing', label: 'ord.filterProcessing', match: (o) => isPreparing(o.status) },
+  { key: 'shipped', label: 'ord.filterShipped', match: (o) => isInTransit(o.status) },
+  { key: 'delivered', label: 'ord.filterDelivered', match: (o) => isDelivered(o.status) },
+  { key: 'cancelled', label: 'ord.filterCancelled', match: (o) => isCancelled(o.status) },
+  { key: 'returned', label: 'ord.filterReturned', match: (o) => isReturned(o.status) },
 ];
 
 const SORTS: SortDef<api.Order>[] = [
@@ -69,10 +71,53 @@ export default function OrdersTab({
   const [filter, setFilter] = useState('all');
   const [sort, setSort] = useState('newest');
   const [shipping, setShipping] = useState<string | null>(null);
+  const [advancing, setAdvancing] = useState<string | null>(null);
+  const [uploading, setUploading] = useState<string | null>(null);
 
   const shown = useMemo(
     () => applyList(orders, FILTERS, filter, SORTS, sort),
     [orders, filter, sort]);
+
+  /**
+   * Move an order to whatever the server says is next for THIS caller, on THIS order.
+   *
+   * `o.nextStage` already came from the same permission rule the tracker uses
+   * (transit.next_stage_for), so there is nothing to decide here about who is
+   * allowed to do what - only whether the request succeeded. An artisan viewing her
+   * own orders sees her own next stage (packaging, ready for pickup); the cluster
+   * owner viewing theirs sees the logistics stages. Neither can see a button for a
+   * stage that belongs to the other, because the server never sends one.
+   */
+  async function advanceOrder(o: api.Order) {
+    if (!o.nextStage) return;
+    setAdvancing(o.id);
+    try {
+      await api.advanceOrder(o.id, o.nextStage);
+      onRefresh();
+    } catch (e: any) {
+      Alert.alert(t('track.cannot'), e?.message || 'That did not go through.');
+    } finally {
+      setAdvancing(null);
+    }
+  }
+
+  /** Same camera-and-upload flow the tracker offers, reachable directly from the
+   *  list so packaging a parcel does not require opening a second screen first. */
+  async function recordPackaging(o: api.Order) {
+    setUploading(o.id);
+    const r = await recordAndUploadPackagingVideo(o.id);
+    setUploading(null);
+    if (r.ok) {
+      onRefresh();
+      Alert.alert(t('track.proofAdded'), t('track.proofAddedBody'));
+      return;
+    }
+    if (r.reason === 'permission') {
+      Alert.alert(t('track.cameraNeeded'), t('track.cameraWhy'));
+    } else if (r.reason === 'error') {
+      Alert.alert(t('track.proofFailed'), r.message);
+    }
+  }
 
   // An order belongs to an account. A guest has no account, so there is genuinely
   // nothing to show - and saying why is better than an empty list.
@@ -143,6 +188,20 @@ export default function OrdersTab({
               </View>
               <StatusChip status={o.status} />
             </View>
+
+            {/* The direct action, right at the top: this is what somebody opening
+                the tab holding a parcel actually wants to do, and it should not be
+                a fourth thing to find after amount, quantity and payment status. */}
+            {o.needsPackagingProof ? (
+              <Btn label={uploading === o.id ? t('track.uploading')
+                                              : t('ord.recordPackaging')}
+                   tone="primary" busy={uploading === o.id}
+                   onPress={() => recordPackaging(o)} />
+            ) : o.nextStage ? (
+              <Btn label={t('ord.markAs', { stage: o.nextStageLabel || o.nextStage })}
+                   tone="primary" busy={advancing === o.id}
+                   onPress={() => advanceOrder(o)} />
+            ) : null}
 
             <Row label={t('ord.amount')} value={money(o.amount)} strong />
             <Row label={t('ord.quantity')} value={String(o.quantity)} />

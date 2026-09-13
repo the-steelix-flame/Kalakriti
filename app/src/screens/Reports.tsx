@@ -14,15 +14,20 @@
  * showing zero, because "nothing owed" and "never worked out" are different answers.
  */
 import React, { useCallback, useEffect, useState } from 'react';
-import { View, Text, RefreshControl } from 'react-native';
-import { C, S, T } from '../theme';
-import { Btn, Card, Divider, Pill, Row, Skeleton } from '../ui';
+import { View, Text, Image, RefreshControl } from 'react-native';
+import { C, S, T, R } from '../theme';
+import { Btn, Card, Divider, Pill, Row, Skeleton, StatusChip, money } from '../ui';
+import { MetricGrid, MetricTile, Metric } from '../ui/Metric';
 import { TabScreen } from '../nav/Shell';
 import { useI18n } from '../i18n';
+import { ago } from '../lib/ago';
 import * as api from '../lib/api';
 
-function money(n: number) {
-  return `₹${Math.round(n).toLocaleString('en-IN')}`;
+/** A plain number wrapped in the shape ui/Metric.tsx expects, for a figure that is
+ *  always known here - Reports never shows "not computed" for its own arithmetic,
+ *  only for payouts before any settlement exists, which is handled separately. */
+function known(value: number): Metric {
+  return { value, available: true, why: '', source: '' };
 }
 
 export default function Reports({
@@ -73,29 +78,25 @@ export default function Reports({
 
       {data ? (
         <>
-          {/* ── money that arrived ─────────────────────────────────────── */}
-          <Card tone="money">
-            <Text style={T.label}>{t('rep.revenue')}</Text>
-            <Text style={[T.title, { fontSize: 28, color: C.moneyDeep }]}>
-              {money(data.revenue.gross)}
-            </Text>
-            <Text style={T.micro}>
-              {t('rep.fromPaid', { n: data.revenue.paidOrders })}
-            </Text>
-            {data.revenue.why ? (
-              <Text style={T.bodySoft}>{data.revenue.why}</Text>
-            ) : null}
-            {data.revenue.unpaidOrders ? (
-              <>
-                <Divider />
-                <Row label={t('rep.unpaid')}
-                     value={String(data.revenue.unpaidOrders)} />
-                <Text style={[T.micro, { fontSize: 11.5 }]}>
-                  {t('rep.unpaidWhy')}
-                </Text>
-              </>
-            ) : null}
-          </Card>
+          {/* ── money that arrived ─────────────────────────────────────────
+              MetricGrid/MetricTile rather than a hand-built Card+Row: it is the
+              same component MarketplaceDetail uses for its per-channel figures, so a
+              number reads the same way - same size, same "why" affordance - wherever
+              it appears in the app instead of Reports inventing its own look. */}
+          <Text style={T.section}>{t('rep.revenue')}</Text>
+          <MetricGrid>
+            <MetricTile label={t('rep.revenue')} metric={known(data.revenue.gross)}
+                        currency />
+            <MetricTile label={t('rep.fromPaid', { n: data.revenue.paidOrders })}
+                        metric={known(data.revenue.paidOrders)} />
+            <MetricTile label={t('rep.unpaid')}
+                        metric={known(data.revenue.unpaidOrders)} />
+          </MetricGrid>
+          {data.revenue.why ? (
+            <Card tone="soft"><Text style={T.bodySoft}>{data.revenue.why}</Text></Card>
+          ) : data.revenue.unpaidOrders ? (
+            <Text style={[T.micro, { fontSize: 11.5 }]}>{t('rep.unpaidWhy')}</Text>
+          ) : null}
 
           {channels.length ? (
             <Card>
@@ -142,6 +143,39 @@ export default function Reports({
             <Row label={t('rep.live')} value={String(data.products.live)} />
             <Row label={t('rep.total')} value={String(data.products.total)} />
           </Card>
+
+          {/* ── recent orders, drawn exactly like the Orders tab draws them ──────
+              Same StatusChip, same status vocabulary (transit's stage keys), so an
+              order compared side by side on the two screens looks like the same
+              order rather than two screens that quietly disagree about it. */}
+          {data.recentOrders.length ? (
+            <>
+              <Text style={T.section}>{t('rep.recentOrders')}</Text>
+              {data.recentOrders.map((o) => (
+                <Card key={o.id}>
+                  <View style={{ flexDirection: 'row', alignItems: 'center',
+                                gap: S.sm }}>
+                    {o.imageUrl ? (
+                      <Image source={{ uri: o.imageUrl }}
+                             style={{ width: 40, height: 40, borderRadius: R.md,
+                                      backgroundColor: C.bgAlt }} />
+                    ) : null}
+                    <View style={{ flex: 1 }}>
+                      <Text style={[T.body, { fontFamily: 'Mukta_700Bold' }]}
+                            numberOfLines={1}>
+                        {o.buyerName || t('ord.buyer')}
+                      </Text>
+                      <Text style={[T.micro, { fontSize: 12 }]}>
+                        {o.title || o.id} · {ago(t, o.createdAt)}
+                      </Text>
+                    </View>
+                    <StatusChip status={o.status} />
+                  </View>
+                  <Row label={t('ord.amount')} value={money(o.amount)} />
+                </Card>
+              ))}
+            </>
+          ) : null}
 
           <Btn label={t('rep.seeOrders')} tone="indigo" onPress={onOrders} />
 

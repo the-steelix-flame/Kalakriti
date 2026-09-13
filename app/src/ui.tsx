@@ -391,6 +391,18 @@ export function StatusChip({ status }: { status: string }) {
     payment_pending: 'warn', shipped: 'warn', packed: 'warn', confirmed: 'warn',
     failed: 'danger', cancelled: 'danger', refunded: 'danger',
     not_configured: 'soft', draft: 'soft', created: 'indigo', sold: 'indigo',
+
+    // transit.py's stage keys. Order.status holds these once an order has moved past
+    // checkout, so a chip that only recognised the older created/paid/shipped words
+    // rendered every one of them grey - technically correct, visually useless. The
+    // three tones below track the same escalation the transit board draws: artisan
+    // work in amber, ops/logistics work in indigo, done in green.
+    assigned: 'warn', preparing: 'warn', ready: 'warn', packaging: 'warn',
+    packaged: 'warn', pickup_ready: 'warn',
+    picked_up: 'indigo', at_collection: 'indigo', qc: 'indigo', grn: 'indigo',
+    at_warehouse: 'indigo', shipment: 'indigo', in_transit: 'indigo',
+    out_for_delivery: 'indigo',
+    settled: 'good', initiated: 'soft',
   };
   return <Pill text={status.replace(/_/g, ' ')} tone={map[status] || 'soft'} />;
 }

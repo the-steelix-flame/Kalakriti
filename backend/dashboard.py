@@ -344,7 +344,31 @@ def reports(s, artisan: db.Artisan) -> dict[str, Any]:
     setts = (s.query(db.Settlement).filter(db.Settlement.cluster_id.in_(owned)).all()
              if owned else [])
 
+    # A handful of the most recent orders, in exactly the shape /v1/orders returns a
+    # row - same status field, same stage/stageLabel from transit.stage_of. This is
+    # what lets the Reports screen draw an order with the identical StatusChip the
+    # Orders tab draws, rather than the two screens quietly inventing two different
+    # ways to say "packaging".
+    recent = sorted(orders, key=lambda o: o.created_at or db.now(), reverse=True)[:8]
+    recent_rows = []
+    for o in recent:
+        lst = s.get(db.Listing, o.listing_id) if o.listing_id else None
+        stage = transit.stage_of(o)
+        recent_rows.append({
+            "id": o.id,
+            "title": (lst.title_en or lst.title_hi) if lst else "",
+            "imageUrl": lst.image_url if lst else "",
+            "status": stage,
+            "stageLabel": transit.BY_KEY.get(stage, {}).get("label", stage),
+            "amount": o.amount or 0,
+            "quantity": o.quantity or 0,
+            "buyerName": o.buyer_name or "",
+            "paymentStatus": o.payment_status or "",
+            "createdAt": o.created_at.isoformat() if o.created_at else None,
+        })
+
     return {
+        "recentOrders": recent_rows,
         "revenue": {
             "paidOrders": len(paid),
             "gross": round(sum(float(o.amount or 0) for o in paid), 2),

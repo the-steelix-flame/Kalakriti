@@ -55,6 +55,56 @@ function Terms({ c }: { c: api.Cluster }) {
 
 /* ───────────────────────────────────────────────────── one cluster's card */
 
+/**
+ * What this cluster makes, minus what the viewer made herself.
+ *
+ * Fetched only once the card is expanded and only for somebody who has actually
+ * joined - the server refuses anybody else, and there is no reason to spend a
+ * request finding that out before she has even opened the card. Her own listings are
+ * never in the answer: she already knows what she made, and the point of this list is
+ * seeing what everyone *else* here is producing.
+ */
+function ClusterProducts({ clusterId }: { clusterId: string }) {
+  const { t } = useI18n();
+  const [products, setProducts] = useState<api.ClusterProduct[] | null>(null);
+  const [err, setErr] = useState('');
+
+  useEffect(() => {
+    let alive = true;
+    api.clusterProducts(clusterId)
+      .then((r) => { if (alive) setProducts(r.products); })
+      .catch((e: any) => { if (alive) setErr(e?.message || 'Could not load this.'); });
+    return () => { alive = false; };
+  }, [clusterId]);
+
+  return (
+    <View style={{ gap: 6 }}>
+      <Text style={[T.label, {}]}>{t('clu.whatClusterMakes')}</Text>
+      {err ? (
+        <Text style={[T.micro, { color: C.inkSoft }]}>{err}</Text>
+      ) : products === null ? (
+        <Skeleton h={40} />
+      ) : products.length === 0 ? (
+        <Text style={[T.micro, { color: C.inkSoft }]}>
+          {t('clu.whatClusterMakesNone')}
+        </Text>
+      ) : (
+        products.map((p) => (
+          <View key={p.id} style={{ flexDirection: 'row', alignItems: 'center',
+                                    gap: S.sm }}>
+            <Text style={[T.micro, { flex: 1 }]} numberOfLines={1}>
+              {p.title}{p.maker ? ` · ${p.maker}` : ''}
+            </Text>
+            <Text style={[T.micro, { color: C.money }]}>
+              ₹{Math.round(p.price).toLocaleString('en-IN')}
+            </Text>
+          </View>
+        ))
+      )}
+    </View>
+  );
+}
+
 function ClusterCard({
   c, onJoin, onLeave, busy, expanded, onToggle,
 }: {
@@ -124,6 +174,10 @@ function ClusterCard({
               ))}
             </View>
           </View>
+
+          {/* Other members' work. Members only - a browsing outsider has not joined
+              yet and this is not the terms she is deciding on, it is the shop floor. */}
+          {joined ? <ClusterProducts clusterId={c.id} /> : null}
 
           {/* Rating, or an honest statement that there is none. Never zero stars. */}
           <View style={{ gap: 6 }}>

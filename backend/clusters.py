@@ -575,3 +575,53 @@ def release_capacity(s, artisan: db.Artisan, units: int,
             "capacityUnits": artisan.capacity_units or 0,
             "capacityCommitted": artisan.capacity_committed or 0,
             "capacityAvailable": artisan.capacity_available}
+
+
+def member_listings(s, cluster: db.Cluster, viewer: db.Artisan) -> list[dict[str, Any]]:
+    """
+    What this cluster sells, from a member's own side, minus what is already hers.
+
+    This is not the owner's dashboard - that one shows every listing including her
+    own, because the owner is answerable for all of it. A member browsing the
+    cluster's own catalogue is asking a different question: what is everyone else
+    here making, so she can avoid duplicating a design, coordinate a matching set, or
+    just see what her cluster is known for. Her own products are not an answer to
+    that question - she already knows what she made - so they are excluded rather
+    than shown back to her.
+
+    Requires active membership or ownership; anybody else gets nothing, checked by
+    the caller before this is reached.
+    """
+    rows = (s.query(db.Listing)
+            .filter(db.Listing.cluster_id == cluster.id,
+                    db.Listing.artisan_id != viewer.id,
+                    db.Listing.status.in_(("active", "published")),
+                    db.Listing.quantity > 0,
+                    db.Listing.image_url != "",
+                    db.Listing.image_url.isnot(None))
+            .order_by(db.Listing.updated_at.desc()).limit(60).all())
+    out = []
+    for l in rows:
+        a = s.get(db.Artisan, l.artisan_id) if l.artisan_id else None
+        out.append({
+            "id": l.id,
+            "title": l.title_en or l.title_hi or "Handmade piece",
+            "price": l.price or 0,
+            "currency": l.currency or "INR",
+            "imageUrl": l.image_url or "",
+            "quantity": l.quantity or 0,
+            "maker": (a.business_name or a.full_name) if a else "",
+        })
+    return out
+
+
+def is_member_or_owner(s, artisan: db.Artisan, cluster: db.Cluster) -> bool:
+    """Active member, or the owner. The gate for anything cluster-internal that is
+    not the owner-only operations view."""
+    if cluster.owner_artisan_id == artisan.id:
+        return True
+    return bool(s.query(db.ClusterMembership)
+               .filter(db.ClusterMembership.cluster_id == cluster.id,
+                       db.ClusterMembership.artisan_id == artisan.id,
+                       db.ClusterMembership.status == "active")
+               .first())

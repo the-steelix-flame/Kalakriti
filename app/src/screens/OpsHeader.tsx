@@ -18,7 +18,7 @@ import React from 'react';
 import { View, Text, Pressable } from 'react-native';
 import { C, S, T, R, shadow } from '../theme';
 import { Card, Pill, Skeleton } from '../ui';
-import { Tag, Rupee, Users, Check, Trend, Warning } from '../icons';
+import { Tag, Users, Warning } from '../icons';
 import { useI18n } from '../i18n';
 import * as api from '../lib/api';
 
@@ -120,7 +120,7 @@ function Action({
 
 export default function OpsHeader({
   metrics, loading, onPendingReviews, onLiveProducts, onActiveOrders,
-  onPayouts, onRevenue, onBulkSplitting, onRoster, onClusters,
+  onPayouts, onRevenue, onBulkSplitting, onClusters,
 }: {
   metrics: api.DashboardMetrics | null;
   loading: boolean;
@@ -130,7 +130,6 @@ export default function OpsHeader({
   onPayouts: () => void;
   onRevenue: () => void;
   onBulkSplitting: () => void;
-  onRoster: () => void;
   onClusters: () => void;
 }) {
   const { t } = useI18n();
@@ -163,14 +162,20 @@ export default function OpsHeader({
               money tone="money" onPress={onRevenue} />
       </View>
 
+      {/*
+        Three shortcuts, not four. "Artisan roster" used to sit here and it was a dead
+        duplicate: it opened the same Clusters screen "My clusters" already opens,
+        because a roster is not its own destination - it is the member list inside a
+        cluster you run, and that view already exists inside My Clusters -> a cluster
+        you own. Two buttons that land on the same screen is not a shortcut, it is
+        confusion about which one to press, so this one was removed rather than
+        pointed somewhere real.
+      */}
       <Text style={[T.section, { marginTop: S.sm }]}>{t('ops.quickActions')}</Text>
       <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: S.sm }}>
         <Action label={t('ops.bulkSplitting')} sub={t('ops.bulkSplittingSub')}
                 icon={<Users color={C.indigo} size={19} />}
                 onPress={onBulkSplitting} />
-        <Action label={t('ops.roster')} sub={t('ops.rosterSub')}
-                icon={<Check color={C.money} size={19} />}
-                onPress={onRoster} />
         <Action label={t('ops.myClusters')} sub={t('ops.myClustersSub')}
                 icon={<Tag color={C.primary} size={19} />}
                 onPress={onClusters} />

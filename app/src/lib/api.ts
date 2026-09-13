@@ -116,6 +116,21 @@ export type Order = {
   buyerPhone: string; buyerEmail: string; address: string; quantity: number;
   amount: number; status: string; paymentStatus: string; paymentProvider: string;
   courier: string; trackingId: string; trackingUrl: string; createdAt?: string;
+  /** The order's transit stage (see transit.py), which is what `status` actually
+   *  holds once the order has moved past checkout - "packaging", "in_transit" and so
+   *  on rather than the older created/paid/shipped vocabulary. */
+  stage?: string;
+  stageLabel?: string;
+  /** The single stage the caller may move this order to next, computed server-side
+   *  by the same rule the order tracker uses - so a button here and a button on the
+   *  tracker can never disagree about what happens next. Empty when there is nothing
+   *  this viewer may do (wrong role, or the order is finished). */
+  nextStage?: string;
+  nextStageLabel?: string;
+  /** True when `nextStage` is blocked on a packaging video that has not been
+   *  uploaded yet - the list can then offer "record video" directly instead of a
+   *  plain advance button the server would refuse. */
+  needsPackagingProof?: boolean;
 };
 
 export type AnalyzeOut = {
@@ -562,6 +577,19 @@ export const getCluster = (id: string) => get<Cluster>(`/v1/clusters/${id}`);
 export const clusterByCode = (code: string) =>
   get<Cluster>(`/v1/clusters/by-code/${encodeURIComponent(code.trim())}`);
 
+export type ClusterProduct = {
+  id: string; title: string; price: number; currency: string;
+  imageUrl: string; quantity: number; maker: string;
+};
+
+/**
+ * What this cluster makes, from a member's own side - never the caller's own
+ * listings. Requires active membership or ownership; the server refuses anybody else.
+ */
+export const clusterProducts = (clusterId: string) =>
+  get<{ clusterId: string; products: ClusterProduct[] }>(
+    `/v1/clusters/${clusterId}/products`);
+
 export const createCluster = (b: {
   name: string; craftCategory?: string; commissionPct: number;
   maxOrderUnits?: number; district?: string; state?: string;
@@ -975,7 +1003,20 @@ export type ClusterView = {
 export const clusterView = (id: string) =>
   get<ClusterView>(`/v1/dashboard/cluster/${id}`);
 
+export type ReportOrderRow = {
+  id: string; title: string; imageUrl: string;
+  /** The same transit stage key Order.status holds elsewhere, so StatusChip renders
+   *  this row identically to how it renders the same order in OrdersTab. */
+  status: string; stageLabel: string;
+  amount: number; quantity: number; buyerName: string; paymentStatus: string;
+  createdAt: string | null;
+};
+
 export type Reports = {
+  /** A handful of the most recent orders, in the same status vocabulary the Orders
+   *  tab uses, so the two screens can show one order identically rather than two
+   *  screens quietly inventing two different ways to describe it. */
+  recentOrders: ReportOrderRow[];
   revenue: {
     paidOrders: number; gross: number;
     byChannel: Record<string, { orders: number; amount: number }>;

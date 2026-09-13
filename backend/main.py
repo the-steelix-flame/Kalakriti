@@ -1143,7 +1143,15 @@ def create_order(body: OrderIn) -> dict[str, Any]:
 @app.get("/v1/orders")
 def list_orders(limit: int = 100,
                 authorization: str | None = Header(None)) -> dict[str, Any]:
-    """Orders on the caller's own listings. Buyers' details are seller data."""
+    """
+    Orders on the caller's own listings. Buyers' details are seller data.
+
+    Each row carries its transit stage and, if there is one, the single next stage
+    this caller may move it to - the same rule `transit.timeline` uses, so a list
+    button and the detail screen's button can never disagree about what happens next.
+    `needsPackagingProof` tells the app whether that next stage is "record a video"
+    rather than a plain advance, without a second round trip per row.
+    """
     s = db.session()
     try:
         me = auth.artisan_from_token(s, authorization)
@@ -1153,7 +1161,18 @@ def list_orders(limit: int = 100,
                 .join(db.Listing, db.Order.listing_id == db.Listing.id)
                 .filter(db.Listing.artisan_id == me.id)
                 .order_by(db.Order.created_at.desc()).limit(limit).all())
-        return {"orders": [o.public() for o in rows]}
+        out = []
+        for o in rows:
+            nxt = transit.next_stage_for(s, o, me)
+            row = o.public()
+            row["stage"] = transit.stage_of(o)
+            row["stageLabel"] = transit.BY_KEY.get(row["stage"], {}).get(
+                "label", row["stage"])
+            row["nextStage"] = nxt["stage"]
+            row["nextStageLabel"] = nxt["label"]
+            row["needsPackagingProof"] = nxt["needsProof"]
+            out.append(row)
+        return {"orders": out}
     finally:
         s.close()
 
@@ -1836,6 +1855,30 @@ def list_reviews(cid: str,
         if me is not None:
             out["eligibility"] = clusters.review_eligibility(s, me, cid)
         return out
+    finally:
+        s.close()
+
+
+@app.get("/v1/clusters/{cid}/products")
+def cluster_products(cid: str,
+                     authorization: str | None = Header(None)) -> dict[str, Any]:
+    """
+    What this cluster makes, from a member's own side - never her own listings.
+
+    Requires active membership or ownership. This is deliberately not the same data
+    as the owner's operations view (`/v1/dashboard/cluster/{id}`): that one includes
+    every listing because the owner is answerable for all of it, while this is a
+    member asking what everyone *else* here is making.
+    """
+    s = db.session()
+    try:
+        me = _need_artisan(s, authorization)
+        c = s.get(db.Cluster, cid)
+        if c is None:
+            raise HTTPException(404, "no such cluster")
+        if not clusters.is_member_or_owner(s, me, c):
+            raise HTTPException(403, "join this cluster to see what it makes")
+        return {"clusterId": cid, "products": clusters.member_listings(s, c, me)}
     finally:
         s.close()
 

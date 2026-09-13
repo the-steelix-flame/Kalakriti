@@ -227,6 +227,38 @@ def _proof_url(s, order_id: str) -> str:
     return ""
 
 
+def next_stage_for(s, order: db.Order, viewer: db.Artisan | None) -> dict[str, Any]:
+    """
+    The single next stage this viewer may move the order to, or an empty answer.
+
+    Built for list views - the orders list, the transit board - that show many orders
+    at once and need to know, per row, whether there is a button to draw at all. It is
+    the same rule `timeline()` uses for `canAdvanceTo`, kept in one place so a list
+    screen and the detail screen can never offer two different next actions for the
+    same order.
+
+    `needsProof` tells the caller whether the next stage is blocked on a packaging
+    video that has not arrived yet, so a list row can go straight to "record video"
+    instead of a plain advance button that the server would refuse.
+    """
+    role = role_of(s, viewer, order)
+    if role == "guest":
+        return {"stage": "", "label": "", "needsProof": False}
+    current = stage_of(order)
+    if current == "cancelled":
+        return {"stage": "", "label": "", "needsProof": False}
+    here = index_of(current)
+    for key in ORDER:
+        if index_of(key) <= here:
+            continue
+        if not may_enter(role, key)[0]:
+            continue
+        spec = BY_KEY[key]
+        needs_proof = bool(spec.get("needs_proof") and not _proof_url(s, order.id))
+        return {"stage": key, "label": spec["label"], "needsProof": needs_proof}
+    return {"stage": "", "label": "", "needsProof": False}
+
+
 def attach_proof(s, order: db.Order, *, artisan: db.Artisan, url: str,
                  note: str = "", seconds: float = 0.0) -> dict[str, Any]:
     """

@@ -14,20 +14,20 @@
  * sentence saying whose stage it is.
  *
  * The packaging video is real evidence, captured with the phone's own camera through
- * expo-image-picker. The system camera gives record, review and retake for free and
- * is far more reliable on a cheap phone than a custom recorder; the file is then
- * streamed to the same bucket the product photographs live in. Packaging cannot be
- * marked complete without it - the server enforces that, not just this screen.
+ * lib/packagingVideo.ts (expo-image-picker underneath). The Orders list offers the
+ * same action for the same reason, so the capture-and-upload sequence itself lives
+ * there rather than here, to keep the two screens from drifting apart. Packaging
+ * cannot be marked complete without it - the server enforces that, not just here.
  */
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { View, Text, Image, ScrollView, Pressable, RefreshControl, Linking,
          ActivityIndicator, Alert } from 'react-native';
-import * as ImagePicker from 'expo-image-picker';
 import { C, S, T, R } from '../theme';
 import { Btn, Card, Pill, Row, Skeleton, Divider } from '../ui';
 import { TopBar } from '../nav/Shell';
 import { useI18n } from '../i18n';
 import * as api from '../lib/api';
+import { recordAndUploadPackagingVideo } from '../lib/packagingVideo';
 
 function money(n: number) {
   return `₹${Math.round(n).toLocaleString('en-IN')}`;
@@ -189,39 +189,32 @@ export default function OrderTracker({
     }
   }
 
-  /** Record with the phone's camera, then stream the file up. */
+  /**
+   * Record with the phone's camera, then stream the file up.
+   *
+   * The camera/upload sequence itself lives in lib/packagingVideo.ts, shared with the
+   * Orders list so the two screens cannot drift into offering slightly different
+   * behaviour for what is meant to be one action.
+   */
   async function recordPackaging() {
-    try {
-      const perm = await ImagePicker.requestCameraPermissionsAsync();
-      if (!perm.granted) {
-        Alert.alert(t('track.cameraNeeded'), t('track.cameraWhy'));
-        return;
-      }
-      const shot = await ImagePicker.launchCameraAsync({
-        mediaTypes: ['videos'],
-        // Short on purpose. This is proof the parcel was sealed, not a film, and the
-        // artisan is often paying for the megabytes.
-        videoMaxDuration: 30,
-        quality: 0.7,
-      });
-      if (shot.canceled || !shot.assets?.length) return;
-      const asset = shot.assets[0];
-
-      setUpPct(0);
-      const out = await api.uploadPackagingVideo(orderId, asset.uri, {
-        seconds: (asset.duration || 0) / 1000,
-      });
-      setTl(out.timeline);
-      setUpPct(-1);
+    setUpPct(0);
+    const r = await recordAndUploadPackagingVideo(orderId);
+    setUpPct(-1);
+    if (r.ok) {
+      setTl(r.timeline);
       Alert.alert(t('track.proofAdded'), t('track.proofAddedBody'));
-    } catch (e: any) {
-      setUpPct(-1);
+      return;
+    }
+    if (r.reason === 'permission') {
+      Alert.alert(t('track.cameraNeeded'), t('track.cameraWhy'));
+    } else if (r.reason === 'error') {
       // The upload is the whole point of the step, so a failure has to be loud. A
       // silent one would let the artisan believe the evidence is attached when the
       // server has nothing, and packaging would then refuse to complete with no
       // explanation she could connect to this.
-      Alert.alert(t('track.proofFailed'), e?.message || 'The upload did not finish.');
+      Alert.alert(t('track.proofFailed'), r.message);
     }
+    // 'cancelled' needs no alert - she chose to close the camera.
   }
 
   if (err && !tl) {

@@ -910,8 +910,6 @@ export const EN = {
   'ops.quickActions': 'Quick actions',
   'ops.bulkSplitting': 'Bulk order splitting',
   'ops.bulkSplittingSub': 'Large orders to divide',
-  'ops.roster': 'Artisan roster',
-  'ops.rosterSub': 'Who has hands free',
   'ops.myClusters': 'My clusters',
   'ops.myClustersSub': 'Listings and orders',
   'ops.listingReviews': 'Listing reviews',
@@ -1017,6 +1015,17 @@ export const EN = {
   'track.exc.wrong_product': 'Wrong product',
   'track.exc.address_problem': 'Problem with the address',
   'track.exc.packaging_problem': 'Problem with the packaging',
+
+  /* ── per-order actions in the Orders list ─────────────────────────────── */
+  'ord.recordPackaging': 'Record packaging video',
+  'ord.markAs': 'Mark as {stage}',
+
+  /* ── what a cluster's other members are making ────────────────────────── */
+  'clu.whatClusterMakes': 'What this cluster makes',
+  'clu.whatClusterMakesNone': 'Nobody else here has anything for sale yet.',
+
+  /* ── reports: recent orders, matching the Orders tab ──────────────────── */
+  'rep.recentOrders': 'Recent orders',
 } as const;
 
 export type StringKey = keyof typeof EN;
@@ -1887,8 +1896,6 @@ export const HI: Record<StringKey, string> = {
   'ops.quickActions': 'जल्दी के काम',
   'ops.bulkSplitting': 'बड़े ऑर्डर का बँटवारा',
   'ops.bulkSplittingSub': 'बाँटने वाले ऑर्डर',
-  'ops.roster': 'कारीगरों की सूची',
-  'ops.rosterSub': 'किसके हाथ खाली हैं',
   'ops.myClusters': 'मेरे क्लस्टर',
   'ops.myClustersSub': 'सामान और ऑर्डर',
   'ops.listingReviews': 'सामान की जाँच',
@@ -1994,4 +2001,15 @@ export const HI: Record<StringKey, string> = {
   'track.exc.wrong_product': 'गलत सामान',
   'track.exc.address_problem': 'पते में दिक्कत',
   'track.exc.packaging_problem': 'पैकिंग में दिक्कत',
+
+  /* ── ऑर्डर सूची में सीधी कार्रवाई ───────────────────────────────────────── */
+  'ord.recordPackaging': 'पैकिंग का वीडियो बनाएँ',
+  'ord.markAs': '{stage} दर्ज करें',
+
+  /* ── क्लस्टर के दूसरे सदस्य क्या बना रहे हैं ───────────────────────────── */
+  'clu.whatClusterMakes': 'यह क्लस्टर क्या बनाता है',
+  'clu.whatClusterMakesNone': 'यहाँ अभी किसी और के पास बेचने के लिए कुछ नहीं है।',
+
+  /* ── हिसाब: हाल के ऑर्डर, ऑर्डर टैब जैसे ही ───────────────────────────── */
+  'rep.recentOrders': 'हाल के ऑर्डर',
 };
